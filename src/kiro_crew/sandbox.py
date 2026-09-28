@@ -578,6 +578,32 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     "computer_use.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
+    # The runtime config and its overlay. They are ordinary settings files, but they
+    # also carry the switches that LOOSEN confinement -- ``agent.sandbox`` (``"off"``
+    # skips this very sandbox for every later spawn), ``agent.apps_allow_third_party`` /
+    # ``agent.apps_trusted`` (admit app code the gateway runs in-process, outside any
+    # sandbox), ``agent.sandbox_allow_unsandboxed_exec``, ``agent.approval_mode``. The
+    # loader's load-time clamp neutralises an inflated number, not a loosened switch, and
+    # ``is_sensitive_write_path`` fences only the file-edit tool: a spawned shell's
+    # ``open(..., "w")`` reaches the file however the write is spelled, so only a kernel
+    # denial holds. Both files are sealed because ``KiroCrewConfig.load()`` deep-merges
+    # ``config.local.json`` OVER ``config.json``, so sealing one leaves the setting
+    # writable through the other. Every legitimate writer -- the dashboard config API,
+    # the channel handlers, the gateway's boot-time default and migrations, and
+    # ``kirocrew config`` from the operator's own terminal -- runs outside the sandbox;
+    # reads stay open, and an in-sandbox ``kirocrew config set`` fails with a pointer to
+    # those surfaces (``cli_config``). Each file's ``<leaf>.lock`` sidecar is sealed
+    # with it, for the reason ``agent_model_state.json.lock`` is: the advisory lock is
+    # the sidecar's IDENTITY, and ``_config_write_lock`` opens it by path with
+    # ``O_CREAT``. Left writable, a sandboxed process can unlink and recreate it so
+    # two host writers lock DIFFERENT inodes and interleave the in-place publish --
+    # a hybrid of two documents that can parse. No sandboxed process legitimately
+    # takes it: every locker (the config writers above, the vector-memory publish)
+    # runs in the gateway or the operator's terminal.
+    "config.json",
+    "config.json.lock",
+    "config.local.json",
+    "config.local.json.lock",
     # Recorded consent to send conversation state to the external decision
     # provider. Same class as ``aws_service_consent.json``: a writable grant lets
     # an auto-approved agent switch on, for itself, the egress of the messages it
@@ -960,6 +986,23 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # the product depends on and buy nothing.
     "cloud.json",
     "cloud_launch_state.json",
+    # The runtime config and its overlay. NOT credential-free, unlike ``cloud.json``:
+    # a channel bot token stored inline (``telegram.bot_token``, ``discord.bot_token``,
+    # ``weixin``/``webex``; the ``sensitive`` fields in ``config/sections.py``) lives
+    # in these files, and the env/.env spelling those fields recommend is only a
+    # recommendation. The read is granted anyway because in-sandbox code DEPENDS on it:
+    # every ``KiroCrewConfig.load()`` in a sandboxed CLI or MCP server opens both, and
+    # withholding them would mask a read the product cannot run without. It is also
+    # not a widening: neither is on the read-gate floor (``is_sensitive_path`` is False
+    # for both), so the mask never covered them and a child could always open them --
+    # classifying them here keeps exactly what it had. The risk the seal answers is the
+    # WRITE: the switches that loosen confinement, which the read-only entry above
+    # refuses. The lock sidecars ride along: their content is never read, only their
+    # identity is locked, and a sealed lock is what keeps two host writers on one inode.
+    "config.json",
+    "config.json.lock",
+    "config.local.json",
+    "config.local.json.lock",
     # The crew webview template directory. Holds no credential and is no input to an
     # authorization decision an in-sandbox process makes: a template decides how a
     # published panel is laid out, never who may publish one, and every reader runs
@@ -986,10 +1029,15 @@ def crew_host_runtime_leaves() -> tuple[str, ...]:
     """Crew-home leaves an ENFORCED harness's child may read, per this module.
 
     :data:`_CREW_CHILD_READABLE_LEAVES` verbatim -- the half of this module's
-    non-hidden crew leaves that holds no credential AND is no input to an
-    authorization decision: the browser launcher, the authorization sidecars
-    (``apps/.dev-grants.json``, ``settings_seeds.json``, the model-state pair), the
-    gateway-owned run and decision records, and the operator's cloud configuration.
+    non-hidden crew leaves that is no input to an authorization decision and either
+    holds no credential or is one an in-sandbox Crew process cannot boot without: the
+    browser launcher, the authorization sidecars (``apps/.dev-grants.json``,
+    ``settings_seeds.json``, the model-state pair), the gateway-owned run and decision
+    records, the operator's cloud configuration, and the runtime config pair
+    (``config.json`` / ``config.local.json``). That last pair is the exception the
+    "either" carries: it can hold an inline channel bot token, and stays readable
+    because every in-sandbox ``KiroCrewConfig.load()`` depends on it and it was never
+    on the read-gate floor to begin with -- see its entry in the list.
     Its sibling :data:`_CREW_CHILD_WITHHELD_LEAVES` carries the rest, and
     ``test_sandbox_governance_mask`` pins the pair complete and disjoint against
     ``_CREW_SANDBOX_VISIBLE_LEAVES | _CREW_READONLY_LEAVES``, so a leaf added to
@@ -1658,6 +1706,20 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # narrower than the truth (criterion 2).
     "credential_redaction.json",
     "settings_seeds.json",
+    # The runtime config and its overlay. Criterion 1: ``KiroCrewConfig.load()`` yields
+    # the same defaults for ``{}`` as for an absent file, and an empty overlay overrides
+    # nothing; the gateway creates ``config.json`` at boot, so in practice only the
+    # overlay is ever absent here -- which is exactly the name an agent would otherwise
+    # create to win the merge. Criterion 2 does not arise: ``write_config_atomically``
+    # writes these two IN PLACE on Linux, so the bind keeps its inode and a sandboxed
+    # reader sees the live document, read-only, rather than a stale one. The lock
+    # sidecars follow ``agent_model_state.json.lock``: created on first use, so
+    # without pre-creation a sandbox spawned before the first locked write finds
+    # the name absent and creatable -- the replaced-inode attack the seal stops.
+    "config.json",
+    "config.json.lock",
+    "config.local.json",
+    "config.local.json.lock",
     # The cloud launcher's config, and the leaf where an ABSENT file is the more
     # dangerous case: with no file there is no seal, so an agent could CREATE the
     # whole ``fargate`` block -- its own image beside the owner's real secret ARNs --
