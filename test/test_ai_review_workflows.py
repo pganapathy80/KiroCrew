@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -102,6 +103,32 @@ def _bash() -> str | None:
                     return str(candidate)
         return None
     return shutil.which("bash")
+
+
+@functools.lru_cache(maxsize=None)
+def _bash_has_jq(bash: str) -> bool:
+    """Whether *bash* resolves a ``jq`` -- asked of the bash the step runs under.
+
+    ``pr-body-snapshot.sh`` fails closed without ``jq`` ("::error::jq is not
+    available ..."), so a host without one reddens every evidence-step case
+    instead of standing aside. The probe goes through the SAME bash the step
+    will run under, not ``shutil.which`` from this process: Git for Windows'
+    ``bin\\bash.exe`` prepends its own ``/usr/bin`` to ``PATH``, so the two can
+    disagree on what ``jq`` means. Cached per bash, since the answer is a host
+    fact that does not change within a run.
+    """
+    try:
+        probe = subprocess.run(
+            [bash, "-c", "command -v jq"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
 
 
 def _prompt(name: str) -> str:
@@ -2567,6 +2594,10 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
         bash = _bash()
         if bash is None:
             pytest.skip("the evidence step runs only under Bash")
+        if not _bash_has_jq(bash):
+            pytest.skip(
+                "the evidence step reads the description through jq; skip where jq is absent"
+            )
         env = self._git_env(tmp_path)
         # One CALL of this harness is one job, and several cases below run it
         # twice to compare two runs of the same lane -- a 404 then a 503 on the

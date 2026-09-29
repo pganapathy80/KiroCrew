@@ -709,3 +709,26 @@ The consequence for how you write a test:
 - [ ] A test that asserts a key PASSES THROUGH a scrub (`HOME`, `PATH`) plants that key in the
       parent first — CI runners export `HOME` on Windows, a server session does not, and the
       assertion otherwise measures the host
+- [ ] A refusal raised by an object that holds a process-global resource (a crew-log handle
+      and its write lease) is asserted through a CLASS-based context manager whose `__exit__`
+      copies the exception's fields into a plain record and returns -- never
+      `pytest.raises(...) as exc` (the `ExceptionInfo` and the test frame form a cycle that
+      keeps `append`'s `self` alive until the cyclic collector runs) and never a
+      `@contextlib.contextmanager` (throwing into a generator adds the same cycle through the
+      generator's frame); the file's autouse teardown pins the table (`lease._held`) empty
+      without `gc.collect()`
+- [ ] A stand-in handed to a table that judges liveness by probe (`RUNTIME_TENANCY._alive`
+      reads `is_alive` / `is_process_alive`) either answers the probe or its test releases the
+      claim itself -- a fake with neither is alive for the rest of the worker -- and a stubbed
+      `_dispose_*` still owes every release the real one performs
+- [ ] A test that hands the reaper a reset that never returns (`_hanging_reset`) pins
+      `_RESET_TIMEOUT` the way its sibling classes do; a passing test whose wall time lands on a
+      product constant (30.0 s, 60.0 s) with the CPU idle is spending that constant, not
+      measuring it -- `classify.py`'s TIMEOUT-SHAPED rows name them
+- [ ] `monkeypatch.delenv(key, raising=False)` on a key that is ABSENT records no undo: when the
+      product then `os.environ.setdefault`s it, `setenv` the key first so the fixture's undo
+      removes whatever the product leaves
+- [ ] A harness that runs a real shell script gates on EVERY tool the script requires (`bash`
+      and `jq` both), probed through the bash it will run under rather than `shutil.which`
+      from the test process; a file that already carries such a gate (`_stub_path`) is telling
+      you the precondition exists and this harness forgot to use it
