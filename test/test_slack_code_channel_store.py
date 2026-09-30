@@ -166,6 +166,25 @@ class TestCodeChannelStoreIsProtected:
 
 
 class TestArchiveAndRaces:
+    def test_plan_canvases_survive_a_restart(self, tmp_path):
+        """publish_plan_canvas may only rewrite canvases it created in the channel,
+        so the record keeps them; otherwise a restart would lock the agent out of
+        its own plan."""
+        path = tmp_path / "store.json"
+        orch = _populated()
+        orch._code_channel_canvases = {"C_CC": {"F2", "F1"}}
+        code_channel_store.save_channel(orch, "C_CC", path=path)
+        fresh = _orch()
+        fresh._code_channel_canvases = {}
+        code_channel_store.restore_into(fresh, path=path)
+        assert fresh._code_channel_canvases == {"C_CC": {"F1", "F2"}}
+
+    def test_archive_forgets_the_plan_canvases(self):
+        orch = _populated()
+        orch._code_channel_canvases = {"C_CC": {"F1"}}
+        code_channel_store.clear_channel_state(orch, "C_CC")
+        assert orch._code_channel_canvases == {}
+
     def test_clear_channel_state_drops_the_channel_but_keeps_the_origin(self):
         orch = _populated()
         code_channel_store.clear_channel_state(orch, "C_CC")

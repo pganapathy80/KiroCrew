@@ -343,7 +343,7 @@ from kiro_crew.session import (
 )
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.client import RealSlackClient
-from kiro_crew.slack.code_channel_store import restore_into
+from kiro_crew.slack.code_channel_store import restore_into, save_channel
 from kiro_crew.slack.format import (
     build_cron_ack_block,
     build_options_blocks,
@@ -2161,6 +2161,10 @@ class GatewayOrchestrator:
         # Slack assigns to it alone. Only these are always-on; in a code channel
         # another agent owns, it answers when addressed, like any channel.
         self._owned_code_channels: set[str] = set()
+        # Plan canvases publish_plan_canvas created in each code channel. Only these
+        # may be rewritten through it, so an agent cannot overwrite some other
+        # canvas the bot token can reach by naming its id.
+        self._code_channel_canvases: dict[str, set[str]] = {}
         # Refill the per-channel records above from disk, so a restart does not
         # strand an existing code channel without its repo, baseline or origin.
         try:
@@ -11587,6 +11591,8 @@ class GatewayOrchestrator:
         state._code_channel_turn_context = self.code_channel_turn_context
         state._create_code_channel = self.create_code_channel_for_task
         state._code_channel_origin_for_session = self.code_channel_origin_for_session
+        state._set_code_channel_view = self.set_code_channel_view_for_session
+        state._publish_plan_canvas = self.publish_plan_canvas_for_session
 
     def remember_session_origin(self, session_key: str, channel_id: str, message_ts: str) -> None:
         """Record the Slack message that started ``session_key``'s current turn.
@@ -11714,6 +11720,109 @@ class GatewayOrchestrator:
         if not channel:
             return None
         return self._code_channel_origin.get(channel)
+
+    async def set_code_channel_view_for_session(
+        self,
+        session_key: str,
+        view_type: str,
+        content: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        name: str | None = None,
+        view_key: str | None = None,
+    ) -> dict:
+        """Publish a view tab into the code channel ``session_key`` is working in.
+
+        Backs the set_code_channel_view MCP tool. Resolves the target code channel
+        from the session (:meth:`_resolve_session_code_channel`) so the agent can
+        only publish into the channel it is in, then calls
+        ``agents.conversations.setView`` via the client. Returns ``{"ok": bool,
+        "error": str|None}``; ``not_a_code_channel`` when the session is not a code
+        channel, ``slack_unavailable`` when Slack is not running, else the Slack
+        error code the client recorded, and ``code_channels_off`` when
+        ``slack.code_channels`` is off (a record restored from when it was on does
+        not make a channel publishable)."""
+        if not self.slack:
+            return {"ok": False, "error": "slack_unavailable"}
+        if not self._cfg.slack.code_channels:
+            return {"ok": False, "error": "code_channels_off"}
+        channel = self._resolve_session_code_channel(session_key)
+        if not channel:
+            return {"ok": False, "error": "not_a_code_channel"}
+        result = await self.slack.set_code_channel_view(
+            channel,
+            view_type=view_type,
+            content=content,
+            blocks=blocks,
+            name=name,
+            view_key=view_key,
+        )
+        if result is None:
+            err = getattr(self.slack, "_last_code_channel_error", "") or "view_failed"
+            return {"ok": False, "error": err}
+        return {"ok": True, "error": None}
+
+    async def publish_plan_canvas_for_session(
+        self,
+        session_key: str,
+        content: str,
+        title: str | None = None,
+        canvas_id: str | None = None,
+        view_name: str | None = None,
+    ) -> dict:
+        """Create or update a comment-only plan canvas in ``session_key``'s code channel.
+
+        Backs the publish_plan_canvas MCP tool. Resolves the target code channel from
+        the session (:meth:`_resolve_session_code_channel`) so the agent can only
+        publish into the channel it is in. When ``canvas_id`` is given the canvas is
+        UPDATED in place (setCanvasContent, preserving comment anchors); otherwise a
+        new canvas is minted via the general Canvas API (canvases.create — outside
+        the code-channels partner API) and attached as a comment-only view tab so the
+        agent stays sole author while members annotate. Returns ``{"ok", "canvas_id",
+        "updated", "error"}``; ``not_a_code_channel`` when the session is not a code
+        channel, ``slack_unavailable`` when Slack is not running,
+        ``code_channels_off`` when ``slack.code_channels`` is off,
+        ``canvas_not_owned`` when ``canvas_id`` is not a canvas this tool created
+        in that channel, else the Slack error code the client recorded."""
+        if not self.slack:
+            return {"ok": False, "error": "slack_unavailable"}
+        if not self._cfg.slack.code_channels:
+            return {"ok": False, "error": "code_channels_off"}
+        channel = self._resolve_session_code_channel(session_key)
+        if not channel:
+            return {"ok": False, "error": "not_a_code_channel"}
+        if canvas_id:
+            # Update path: rewrite the existing canvas's content in place, but only
+            # a canvas created here for this channel. The id comes from the agent,
+            # and the bot token can write canvases well beyond this channel.
+            if canvas_id not in self._code_channel_canvases.get(channel, set()):
+                return {"ok": False, "error": "canvas_not_owned"}
+            result = await self.slack.set_canvas_content(channel, canvas_id, content)
+            if result is None:
+                err = getattr(self.slack, "_last_code_channel_error", "") or "canvas_failed"
+                return {"ok": False, "error": err}
+            return {"ok": True, "canvas_id": canvas_id, "updated": True, "error": None}
+        # Create path: mint a standalone canvas, then attach it as a comment-only tab.
+        new_id = await self.slack.create_canvas(title=title, content=content)
+        if not new_id:
+            err = getattr(self.slack, "_last_code_channel_error", "") or "canvas_creation_failed"
+            return {"ok": False, "error": err}
+        # Recorded as soon as it exists, before the tab is attached: the canvas is
+        # this channel's either way, and a failed attach must not leave the agent
+        # unable to update the canvas it just made.
+        self._code_channel_canvases.setdefault(channel, set()).add(new_id)
+        await asyncio.to_thread(save_channel, self, channel)
+        view = await self.slack.set_code_channel_view(
+            channel,
+            view_type="canvas",
+            canvas_id=new_id,
+            access_level="comment",
+            name=view_name,
+            view_key=f"plan-canvas:{new_id}",
+        )
+        if view is None:
+            err = getattr(self.slack, "_last_code_channel_error", "") or "view_failed"
+            return {"ok": False, "error": err}
+        return {"ok": True, "canvas_id": new_id, "updated": False, "error": None}
 
     async def _init_api_server(self) -> None:
         """Start a minimal API-only HTTP server for MCP tool transport."""

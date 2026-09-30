@@ -5659,6 +5659,12 @@ class DashboardState:
         # (session_key) -> (channel, ts) | None: the origin a session's code
         # channel was opened from, so its result can be posted back there.
         self._code_channel_origin_for_session: Any = None
+        # async (session_key, view_type, content, blocks, name, view_key) -> dict;
+        # publishes a view tab into the code channel the session is bound to.
+        self._set_code_channel_view: Any = None
+        # async (session_key, content, title, canvas_id, view_name) -> dict; creates
+        # or updates a comment-only plan canvas in the session's code channel.
+        self._publish_plan_canvas: Any = None
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)

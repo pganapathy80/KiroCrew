@@ -339,6 +339,7 @@ them are not asked for the extra scopes. To turn them on:
          - code_channels:manage      # all agents.conversations.* calls
          - channels:write.invites    # invite collaborators (public channels)
          - groups:write.invites      # invite collaborators (private channels)
+         - canvases:write            # the plan canvas (publish_plan_canvas)
    ```
 
    No extra event subscription is needed: `message.channels` and `message.groups`

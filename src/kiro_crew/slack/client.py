@@ -315,8 +315,20 @@ class SlackClientOps(ABC):
         blocks: list[dict[str, Any]] | None = None,
         base_branch: str | None = None,
         head_branch: str | None = None,
+        canvas_id: str | None = None,
+        access_level: str | None = None,
     ) -> dict[str, Any] | None:
         """Create/update a code channel view via agents.conversations.setView."""
+        return None
+
+    async def set_canvas_content(
+        self, channel_id: str, canvas_id: str, content: str
+    ) -> dict[str, Any] | None:
+        """Replace a canvas's markdown content (setCanvasContent)."""
+        return None
+
+    async def create_canvas(self, *, title: str | None = None, content: str = "") -> str | None:
+        """Create a standalone canvas (canvases.create). Returns its id or None."""
         return None
 
     async def code_channel_agent_ids(self, channel_id: str) -> list[str] | None:
@@ -1032,16 +1044,22 @@ class RealSlackClient(SlackClientOps):
         blocks: list[dict[str, Any]] | None = None,
         base_branch: str | None = None,
         head_branch: str | None = None,
+        canvas_id: str | None = None,
+        access_level: str | None = None,
     ) -> dict[str, Any] | None:
         """Create or update a view tab on a code channel (agents.conversations.setView).
 
         ``setView`` is an upsert keyed by ``view_key`` (ignored for ``diff``,
         which is a per-channel singleton). ``view_type`` selects what the tab
-        renders: ``html`` (self-contained HTML), ``diff`` (unified diff) or
-        ``block_kit`` (Block Kit ``blocks``).
+        renders: ``html`` (self-contained HTML), ``diff`` (unified diff),
+        ``block_kit`` (Block Kit ``blocks``), or ``canvas`` (an EXISTING canvas
+        attached by ``canvas_id``). For a ``canvas`` view, ``access_level`` grants
+        the channel ``read`` / ``write`` / ``comment`` on that canvas; ``comment``
+        keeps the agent the sole author while members annotate — the pattern a
+        plan-doc canvas uses.
         Returns the view's identity fields (``view_id``, ``content_version``,
-        ``file_id``, ``type``) or None on failure (the Slack error is recorded on
-        ``_last_code_channel_error``).
+        ``file_id``, ``canvas_id``, ``type``) or None on failure (the Slack error
+        is recorded on ``_last_code_channel_error``).
         """
         body: dict[str, Any] = {"channel_id": channel_id, "type": view_type}
         if content is not None:
@@ -1056,18 +1074,88 @@ class RealSlackClient(SlackClientOps):
             body["base_branch"] = base_branch
         if head_branch is not None:
             body["head_branch"] = head_branch
+        # canvas views attach an EXISTING canvas by id; access_level is only
+        # meaningful for them (comment = agent authors, members comment).
+        if canvas_id is not None:
+            body["canvas_id"] = canvas_id
+        if access_level is not None:
+            body["access_level"] = access_level
         try:
             resp = await self._web.api_call("agents.conversations.setView", json=body)
             self._last_code_channel_error = ""
             return {
                 key: resp.get(key)
-                for key in ("view_id", "content_version", "file_id", "type")
+                for key in ("view_id", "content_version", "file_id", "canvas_id", "type")
                 if resp.get(key) is not None
             }
         except Exception as exc:
             self._last_code_channel_error = _slack_error_code(exc)
             logger.warning(
                 "agents.conversations.setView failed (error=%s)",
+                self._last_code_channel_error or "unknown",
+                exc_info=True,
+            )
+            return None
+
+    async def set_canvas_content(
+        self, channel_id: str, canvas_id: str, content: str
+    ) -> dict[str, Any] | None:
+        """Replace a canvas's full markdown content (setCanvasContent).
+
+        The agent sends the WHOLE document; Slack diffs it against the canvas's
+        current sections and applies only the changed ones, so sections you did
+        not touch keep their ids — and the comment threads anchored to them
+        survive. This is what makes a comment-only plan canvas re-writable turn
+        after turn without orphaning the human's feedback. A byte-identical send
+        is a no-op (``sections_changed_count: 0``). Content is capped at 1 MB.
+        Returns the response dict or None on failure.
+        """
+        body: dict[str, Any] = {
+            "channel": channel_id,
+            "canvas_id": canvas_id,
+            "content": content,
+        }
+        try:
+            resp = await self._web.api_call("agents.conversations.setCanvasContent", json=body)
+            self._last_code_channel_error = ""
+            return {k: resp.get(k) for k in ("ok", "canvas_id", "sections_changed_count")}
+        except Exception as exc:
+            self._last_code_channel_error = _slack_error_code(exc)
+            logger.warning(
+                "agents.conversations.setCanvasContent failed (error=%s)",
+                self._last_code_channel_error or "unknown",
+                exc_info=True,
+            )
+            return None
+
+    async def create_canvas(self, *, title: str | None = None, content: str = "") -> str | None:
+        """Create a standalone canvas and return its encoded id (canvases.create).
+
+        This is Slack's GENERAL Canvas API — https://docs.slack.dev/reference/methods/canvases.create,
+        scope ``canvases:write`` — NOT part of the code-channels partner API, which
+        only attaches, reads, or rewrites a canvas that ALREADY exists (setView /
+        getCanvas / setCanvasContent all require a ``canvas_id``). So the first
+        canvas has to be minted here, then attached to a code channel as a
+        comment-only view via :meth:`set_code_channel_view` (``canvas_id`` +
+        ``access_level="comment"``). ``content`` is markdown, sent as the
+        ``document_content`` object ``{"type": "markdown", "markdown": ...}`` and
+        capped by Slack at 1 MB. No ``channel_id`` is passed: the canvas is created
+        standalone and tabbed in via the code-channels view path, not Slack's own
+        channel-canvas tab. Returns the new ``canvas_id``, or None on failure (the
+        Slack error is recorded on ``_last_code_channel_error``).
+        """
+        body: dict[str, Any] = {"document_content": {"type": "markdown", "markdown": content}}
+        if title is not None:
+            body["title"] = title
+        try:
+            resp = await self._web.api_call("canvases.create", json=body)
+            self._last_code_channel_error = ""
+            cid = resp.get("canvas_id")
+            return str(cid) if cid else None
+        except Exception as exc:
+            self._last_code_channel_error = _slack_error_code(exc)
+            logger.warning(
+                "canvases.create failed (error=%s)",
                 self._last_code_channel_error or "unknown",
                 exc_info=True,
             )

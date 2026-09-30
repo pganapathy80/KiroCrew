@@ -290,6 +290,97 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "set_code_channel_view",
+            "description": (
+                "Publish a view tab into the Slack code channel you are working in. "
+                "A view is a rich, persistent tab alongside the conversation: use "
+                "'html' to render a self-contained live status page (dashboard, "
+                "report, preview), 'block_kit' for a structured summary from Block "
+                "Kit blocks, or 'diff' for a unified diff. Call this to give the "
+                "human a glanceable surface that you update as the work progresses "
+                "(re-send with the same view_key to replace it). Only works when "
+                "your current session is a code channel; returns an error otherwise. "
+                "You supply the content, so keep it self-contained (inline styles "
+                "for html)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "view_type": {
+                        "type": "string",
+                        "enum": ["diff", "html", "block_kit"],
+                        "description": "The view kind: 'html', 'block_kit', or 'diff'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "The view body for 'html' (a self-contained HTML "
+                            "document) or 'diff' (unified diff text)."
+                        ),
+                    },
+                    "blocks": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Block Kit blocks for a 'block_kit' view.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short tab label shown on the view.",
+                    },
+                    "view_key": {
+                        "type": "string",
+                        "description": (
+                            "Stable key identifying this view; re-sending the same "
+                            "key updates the existing tab instead of adding one. "
+                            "Ignored for 'diff' (a per-channel singleton)."
+                        ),
+                    },
+                },
+                "required": ["view_type"],
+            },
+        },
+        {
+            "name": "publish_plan_canvas",
+            "description": (
+                "Publish (or update) a shared PLAN canvas in the Slack code channel "
+                "you are working in. A canvas is a live markdown document tabbed "
+                "alongside the conversation: use it for a plan, a design, or an "
+                "investigation writeup the human can COMMENT on while you remain its "
+                "sole author. Call it once with a title + markdown content to create "
+                "the canvas; call it again with the returned canvas_id to rewrite the "
+                "content (comment threads on unchanged sections are preserved). Only "
+                "works when your current session is a code channel; returns an error "
+                "otherwise. You supply the markdown."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Canvas title, shown on the tab (used when creating).",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The full canvas body as markdown.",
+                    },
+                    "canvas_id": {
+                        "type": "string",
+                        "description": (
+                            "Omit to CREATE a new plan canvas; pass the id returned "
+                            "by a prior call to UPDATE that canvas's content in place. "
+                            "Only a canvas this tool created in your code channel can "
+                            "be updated."
+                        ),
+                    },
+                    "view_name": {
+                        "type": "string",
+                        "description": "Optional label for the canvas's view tab.",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+        {
             "name": "send_notification",
             "description": (
                 "Publish a notification to the Kiro Crew notification center "
@@ -778,6 +869,92 @@ def create_code_channel(name: str, args: dict[str, Any]) -> str:
     if resp.get("invite_ok") is False:
         note = f" (note: could not auto-invite everyone — {resp.get('invite_error')})"
     return f"Code channel created: <#{channel_id}>{note}"
+
+
+def set_code_channel_view(name: str, args: dict[str, Any]) -> str:
+    view_type = str(args.get("view_type", "") or "").strip()
+    if view_type not in ("diff", "html", "block_kit"):
+        return "Error: view_type must be one of 'diff', 'html', 'block_kit'."
+    # Same identity/containment/governance bar as create_code_channel: publishing a
+    # view is a Slack side effect on a specific channel, so attribute it to a
+    # STRICTLY-resolved caller (a sub-agent must not publish as its parent's
+    # session), re-assert channel-agent containment (an auto-approved kirocrew-core
+    # call emits no permission event), and gate the messaging capability + Slack
+    # transport on the verified identity.
+    verified_session, strict_err = mcp_core.require_strict_session_key(
+        "Error: cannot verify caller identity for set_code_channel_view "
+        "(no gateway-injected session key or HMAC-verified pid). "
+        "Refusing to publish a Slack view that cannot be attributed."
+    )
+    if not verified_session:
+        return strict_err
+    chan_deny = mcp_core._deny_channel_agent_messaging(verified_session, "set_code_channel_view")
+    if chan_deny:
+        return chan_deny
+    gov_msg = mcp_core._vet_messaging_governance(verified_session)
+    if gov_msg:
+        return f"Error: {gov_msg}"
+    gov_chan = mcp_core._vet_channel_governance(verified_session, "slack")
+    if gov_chan:
+        return f"Error: {gov_chan}"
+    body: dict[str, Any] = {"view_type": view_type}
+    if args.get("content") is not None:
+        body["content"] = str(args.get("content"))
+    if isinstance(args.get("blocks"), list):
+        body["blocks"] = args["blocks"]
+    if args.get("name"):
+        body["name"] = str(args.get("name"))
+    if args.get("view_key"):
+        body["view_key"] = str(args.get("view_key"))
+    resp = mcp_core._post("/api/set-code-channel-view", body, session_key=verified_session)
+    if not resp.get("ok"):
+        # "Error:" prefix so call_tool_with_logging records it as a failure.
+        return f"Error: {resp.get('error') or resp}"
+    return f"Published {view_type} view to the code channel."
+
+
+def publish_plan_canvas(name: str, args: dict[str, Any]) -> str:
+    content = str(args.get("content", "") or "")
+    if not content.strip():
+        return "Error: content is required."
+    # Same identity/containment/governance bar as set_code_channel_view: creating or
+    # rewriting a canvas is a Slack side effect on a specific channel, so attribute
+    # it to a STRICTLY-resolved caller (a sub-agent must not publish as its parent's
+    # session), re-assert channel-agent containment (an auto-approved kirocrew-core
+    # call emits no permission event), and gate the messaging capability + Slack
+    # transport on the verified identity.
+    verified_session, strict_err = mcp_core.require_strict_session_key(
+        "Error: cannot verify caller identity for publish_plan_canvas "
+        "(no gateway-injected session key or HMAC-verified pid). "
+        "Refusing to publish a Slack canvas that cannot be attributed."
+    )
+    if not verified_session:
+        return strict_err
+    chan_deny = mcp_core._deny_channel_agent_messaging(verified_session, "publish_plan_canvas")
+    if chan_deny:
+        return chan_deny
+    gov_msg = mcp_core._vet_messaging_governance(verified_session)
+    if gov_msg:
+        return f"Error: {gov_msg}"
+    gov_chan = mcp_core._vet_channel_governance(verified_session, "slack")
+    if gov_chan:
+        return f"Error: {gov_chan}"
+    body: dict[str, Any] = {"content": content}
+    if args.get("title"):
+        body["title"] = str(args.get("title"))
+    if args.get("canvas_id"):
+        body["canvas_id"] = str(args.get("canvas_id"))
+    if args.get("view_name"):
+        body["view_name"] = str(args.get("view_name"))
+    resp = mcp_core._post("/api/publish-plan-canvas", body, session_key=verified_session)
+    if not resp.get("ok"):
+        # "Error:" prefix so call_tool_with_logging records it as a failure.
+        return f"Error: {resp.get('error') or resp}"
+    cid = resp.get("canvas_id", "")
+    updated = resp.get("updated")
+    verb = "Updated" if updated else "Published"
+    # Return the canvas id so the agent can pass it back to UPDATE this same canvas.
+    return f"{verb} plan canvas (canvas_id={cid}) in the code channel."
 
 
 def send_notification(name: str, args: dict[str, Any]) -> str:
@@ -1296,6 +1473,8 @@ def file_send(name: str, args: dict[str, Any]) -> str:
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "send_message": send_message,
     "create_code_channel": create_code_channel,
+    "set_code_channel_view": set_code_channel_view,
+    "publish_plan_canvas": publish_plan_canvas,
     "send_notification": send_notification,
     "delete_message": delete_message,
     "update_message": update_message,

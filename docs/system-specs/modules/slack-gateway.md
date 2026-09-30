@@ -151,14 +151,14 @@ Slack Socket Mode → events.py (dispatch) → handler.py → SessionManager →
 These are separate, and mixing them up leads to wrong fixes:
 
 - **In Slack, Kiro Crew is the Slack app's bot token** (`RealSlackClient(AsyncWebClient(token=bot_token))`).
-  The bot creates code channels, posts, streams and sets session status with the
-  manifest's OAuth scopes. This is not `kiro-cli`.
+  The bot creates code channels, posts, streams, sets session status and manages
+  canvases with the manifest's OAuth scopes. This is not `kiro-cli`.
 - **Kiro Crew's reasoning is `kiro-cli`** (the KiroACP harness), which authenticates to
   the model backend and never talks to Slack.
-- **The code-channel MCP tools carry no Slack credential.** `create_code_channel` posts
-  to a loopback `_STRICT_INTERNAL_API_PATHS` endpoint authenticated by the internal
-  secret and a strict, verified `X-Session-Key`; the gateway then calls Slack with the
-  bot token.
+- **The code-channel MCP tools carry no Slack credential.** `create_code_channel`,
+  `set_code_channel_view` and `publish_plan_canvas` post to loopback
+  `_STRICT_INTERNAL_API_PATHS` endpoints authenticated by the internal secret and a
+  strict, verified `X-Session-Key`; the gateway then calls Slack with the bot token.
 - **MCP is control, not transport.** The MCP tools are the agent's control verbs. The
   Slack messaging itself (streaming, status, posts) goes over the Slack Web API, and
   inbound events arrive over Socket Mode. Neither is MCP.
@@ -557,6 +557,54 @@ workspace outside the allowlist stops nothing in a code channel either. Where
 a reply is posted is decided separately (`_code_channel_post_ts`: top-level, or inside
 the user's own thread).
 
+**`set_code_channel_view` MCP tool** (kirocrew-core) lets Kiro Crew publish a view tab
+into the code channel it is working in: `view_type` `"html"` (a self-contained live
+status page), `"block_kit"` (a structured surface) or `"diff"` (a unified diff), with an
+optional `name` (the tab label) and `view_key` (send the same key again to replace the
+tab instead of adding one; ignored for `diff`, which is one per channel). It posts to
+the internal-secret-only `POST /api/set-code-channel-view` (`_STRICT_INTERNAL_API_PATHS`)
+and is held to the same identity, containment and governance bar as
+`create_code_channel`. The endpoint carries the caller's `X-Session-Key`, and
+`GatewayOrchestrator.set_code_channel_view_for_session` resolves the target channel from
+that session (`_resolve_session_code_channel`: the session's Slack link, then its origin
+link). It refuses with `not_a_code_channel` unless that channel is a known code channel
+(`_code_channels`), so the agent can only publish into the code channel it is actually
+in, never one it names. With `slack.code_channels` off it refuses with
+`code_channels_off` (503), so a channel record restored from when the flag was on is
+not publishable. It is backed by `agents.conversations.setView`, and a Slack-side
+failure returns the recorded error code.
+
+**`publish_plan_canvas` MCP tool** (kirocrew-core) publishes a comment-only plan canvas
+into the code channel the caller's session is working in: the agent writes it, and
+channel members comment on it. It is held to the same bar as `set_code_channel_view`
+and posts to the internal-secret-only `POST /api/publish-plan-canvas`, which reads
+`X-Session-Key` and calls `GatewayOrchestrator.publish_plan_canvas_for_session`. With
+no `canvas_id` it creates a canvas (a standalone canvas from `create_canvas`, attached
+as a comment-only view tab) and returns the new `canvas_id`; with a `canvas_id` it
+rewrites that canvas in place (`set_canvas_content`). The agent passes the returned id
+back to keep editing the same document. Only a canvas this tool created in that channel
+can be rewritten: each new id is recorded in `_code_channel_canvases` (and in the
+channel record, so it survives a restart) as soon as Slack returns it, and any other
+`canvas_id` is refused with `canvas_not_owned` (409) before a Slack call. The id comes
+from the agent, and the bot token can write canvases well beyond the channel. It refuses
+with `code_channels_off` (503) when the flag is off, as `set_code_channel_view` does.
+
+The client methods behind it, on `SlackClientOps`:
+- `create_canvas(title=..., content=...)` creates a standalone canvas through **Slack's
+  general Canvas API** `canvases.create` (scope `canvases:write`) and returns its
+  `canvas_id`. This is not part of the code-channels partner API, which only attaches or
+  rewrites a canvas that already exists, so the first canvas has to be created here.
+  **It needs the `canvases:write` bot scope, and an existing install has to be
+  reinstalled for that to take effect.**
+- `set_code_channel_view(view_type="canvas", canvas_id=..., access_level="comment")`
+  attaches the canvas as a code-channel view tab.
+- `set_canvas_content(channel, canvas_id, content)`
+  (`agents.conversations.setCanvasContent`) replaces the whole markdown document. Slack
+  compares it section by section, so comments on unchanged sections survive.
+
+Canvas comments are not read back into the agent's turns: the canvas is where members
+annotate the plan, and the agent rewrites it with `set_canvas_content`.
+
 - **Always-on where it is in charge:** Kiro Crew answers without an @-mention only in
   code channels it owns (`_owned_code_channels`): ones it created (persisted
   `activation=always` and marked owned in the channel record) and ones Slack assigns to
@@ -577,14 +625,14 @@ the user's own thread).
   `handler.is_tracked_code_channel`, which is True only for a tracked channel with the
   flag on, never `_code_channels` membership alone.
 - **Survives a restart:** the per-channel record Slack cannot give back (the repo on
-  this machine, the diff baseline taken at open, the origin message, the session anchor
-  and ownership) is kept in `slack-code-channels.json` under the data home by
-  `slack/code_channel_store.py`. It is written at creation, dropped on archive (which
-  also clears the channel's in-memory state) and restored into the orchestrator's maps
-  at startup, in place, so references other components hold stay valid. A missing or
-  corrupt file restores nothing. Writes are serialised, and the agent cannot write the
-  file, because it is an authorization input (see the security spec). The one-shot
-  origin-thread handoff is not persisted.
+  this machine, the diff baseline taken at open, the origin message, the session anchor,
+  ownership and the plan canvases created there) is kept in `slack-code-channels.json`
+  under the data home by `slack/code_channel_store.py`. It is written at creation,
+  dropped on archive (which also clears the channel's in-memory state) and restored into
+  the orchestrator's maps at startup, in place, so references other components hold stay
+  valid. A missing or corrupt file restores nothing. Writes are serialised, and the
+  agent cannot write the file, because it is an authorization input (see the security
+  spec). The one-shot origin-thread handoff is not persisted.
 - **Top-level replies from a linked slot:** an option click in a code channel is routed
   to the linked dashboard slot (`maybe_route_linked_thread`), whose mirror
   (`chat_runner`) posts the echo, stream, reply and next options control.

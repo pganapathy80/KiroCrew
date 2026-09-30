@@ -1680,6 +1680,37 @@ CREATE_CODE_CHANNEL_SCHEMA = ToolSchema(
     ],
 )
 
+#: Slack caps a code-channel view's content at ~1 MB (agents.conversations.setView);
+#: gate the shape here and let the client trim defensively.
+_MAX_VIEW_CONTENT = 1_000_000
+
+SET_CODE_CHANNEL_VIEW_SCHEMA = ToolSchema(
+    tool_name="set_code_channel_view",
+    fields=[
+        FieldSpec(
+            "view_type",
+            str,
+            required=True,
+            allowed=frozenset({"diff", "html", "block_kit"}),
+        ),
+        FieldSpec("content", str, max_len=_MAX_VIEW_CONTENT),
+        FieldSpec("blocks", list),
+        FieldSpec("name", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("view_key", str, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+#: canvases.create / setCanvasContent cap canvas markdown at 1 MB, same as a view.
+PUBLISH_PLAN_CANVAS_SCHEMA = ToolSchema(
+    tool_name="publish_plan_canvas",
+    fields=[
+        FieldSpec("content", str, required=True, max_len=_MAX_VIEW_CONTENT),
+        FieldSpec("title", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("canvas_id", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("view_name", str, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SKILL_SEARCH_SCHEMA = ToolSchema(
     tool_name="skill_search",
     fields=[
@@ -3590,6 +3621,8 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "task_run": TASK_RUN_SCHEMA,
     "send_message": SEND_MESSAGE_SCHEMA,
     "create_code_channel": CREATE_CODE_CHANNEL_SCHEMA,
+    "set_code_channel_view": SET_CODE_CHANNEL_VIEW_SCHEMA,
+    "publish_plan_canvas": PUBLISH_PLAN_CANVAS_SCHEMA,
     "send_notification": SEND_NOTIFICATION_SCHEMA,
     "read_slack_profile": READ_SLACK_PROFILE_SCHEMA,
     "wait": WAIT_SCHEMA,

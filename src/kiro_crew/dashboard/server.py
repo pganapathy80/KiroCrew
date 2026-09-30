@@ -385,6 +385,8 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
     {
         "/api/send-message",
         "/api/create-code-channel",
+        "/api/set-code-channel-view",
+        "/api/publish-plan-canvas",
         "/api/delete-message",
         "/api/update-message",
         "/api/browser-event",
@@ -1897,6 +1899,12 @@ def _register_mcp_routes(app: web.Application) -> None:
     # block) so headless --slack-only mode serves it; on _STRICT_INTERNAL_API_PATHS
     # like send-message.
     app.router.add_post("/api/create-code-channel", handlers.api_create_code_channel)
+    # set_code_channel_view MCP tool — same headless/strict treatment as
+    # create-code-channel; publishes a view tab into the caller's code channel.
+    app.router.add_post("/api/set-code-channel-view", handlers.api_set_code_channel_view)
+    # Same strict-internal trust class as set-code-channel-view; creates/updates a
+    # comment-only plan canvas and attaches it as a view tab in the caller's code channel.
+    app.router.add_post("/api/publish-plan-canvas", handlers.api_publish_plan_canvas)
     app.router.add_post("/api/delete-message", handlers.api_delete_message)
     app.router.add_post("/api/update-message", handlers.api_update_message)
     # send_notification MCP tool (RFC notification bus Phase 5) — registered

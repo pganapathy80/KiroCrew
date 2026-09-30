@@ -100,8 +100,8 @@ Kiro Crew can also open a code channel itself while working on a task, with the
 
 The feature is a Slack partner beta and is off by default. It needs Slack's
 code-channels pilot on your workspace, `features.code_channels.enabled: true` and the
-bot scopes `code_channels:manage`, `channels:write.invites` and
-`groups:write.invites` in the app manifest (then a reinstall), and
+bot scopes `code_channels:manage`, `channels:write.invites`, `groups:write.invites` and
+`canvases:write` (for the plan canvas) in the app manifest (then a reinstall), and
 `slack.code_channels: true` in `config.json`. The setup guide lists the exact
 manifest lines. Without them, `/kirocrew codechannel` reports `feature_disabled` or
 `missing_scope` and nothing else changes.

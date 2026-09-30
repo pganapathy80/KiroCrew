@@ -2,8 +2,8 @@
 
 Slack can say whether a channel is a code channel (``record_channel``), but not
 which repo on this machine it works in, the diff baseline taken when it opened,
-the origin message it posts its result back to, or the ts its one continuous
-session is keyed on. Those live in the
+the origin message it posts its result back to, the ts its one continuous
+session is keyed on, or the plan canvases the agent created there. Those live in the
 orchestrator's in-memory maps and are lost on a gateway restart, after which the
 agent in an existing code channel would not know where its code is. This store
 persists exactly that per-channel record so a restart restores it.
@@ -89,6 +89,12 @@ def restore_into(orch: Any, path: Path | None = None) -> int:
         session_map = getattr(orch, "_code_channel_session_ts", None)
         if isinstance(session_ts, str) and session_ts and session_map is not None:
             session_map[channel] = session_ts
+        canvases = rec.get("canvases")
+        canvas_map = getattr(orch, "_code_channel_canvases", None)
+        if isinstance(canvases, list) and canvas_map is not None:
+            ids = {c for c in canvases if isinstance(c, str) and c}
+            if ids:
+                canvas_map[channel] = ids
         origin = rec.get("origin")
         if (
             isinstance(origin, list)
@@ -118,6 +124,9 @@ def save_channel(orch: Any, channel: str, path: Path | None = None) -> None:
         rec["session_ts"] = session_ts
     if channel in getattr(orch, "_owned_code_channels", ()):
         rec["owned"] = True
+    canvases = getattr(orch, "_code_channel_canvases", {}).get(channel)
+    if canvases:
+        rec["canvases"] = sorted(canvases)
     target = path or _store_path()
     with _WRITE_LOCK:
         # Re-checked under the lock: an archive that ran while this save waited
@@ -149,7 +158,12 @@ def clear_channel_state(orch: Any, channel: str) -> None:
     for set_name in ("_code_channels", "_owned_code_channels"):
         members: set[str] = getattr(orch, set_name, set())
         members.discard(channel)
-    for name in ("_code_channel_repo_by_id", "_code_channel_diff_base", "_code_channel_session_ts"):
+    for name in (
+        "_code_channel_repo_by_id",
+        "_code_channel_diff_base",
+        "_code_channel_session_ts",
+        "_code_channel_canvases",
+    ):
         getattr(orch, name, {}).pop(channel, None)
 
 

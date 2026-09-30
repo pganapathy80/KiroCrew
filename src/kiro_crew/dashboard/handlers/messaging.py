@@ -2919,6 +2919,146 @@ async def api_create_code_channel(request: web.Request) -> web.Response:
     )
 
 
+async def api_set_code_channel_view(request: web.Request) -> web.Response:
+    """POST /api/set-code-channel-view — set_code_channel_view MCP tool transport.
+
+    Publishes a view tab (agents.conversations.setView) into the code channel the
+    caller's session is bound to. MCP/internal-secret only (on
+    ``_STRICT_INTERNAL_API_PATHS``); the tool has already resolved a strict session
+    key. The orchestrator resolves the target channel FROM that session and refuses
+    unless it is a known code channel, so the agent can only publish into the code
+    channel it is actually working in — never an arbitrary channel id.
+
+    Body: ``{"view_type": str, "content"?: str, "blocks"?: list, "name"?: str,
+    "view_key"?: str}``. Returns ``{"ok": true}``; a non-2xx JSON body carries a
+    machine-readable ``code`` field.
+    """
+    state: DashboardState = request.app["state"]
+    # Internal-secret ONLY — this posts to Slack. request["internal_auth"] is set
+    # solely on the validated X-Internal-Secret path the MCP gateway uses; the
+    # strict-internal middleware would otherwise also admit loopback cookie callers.
+    if not request.get("internal_auth"):
+        return web.json_response(
+            {"error": "internal-secret authentication required", "code": "auth_required"},
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    view_type = str(body.get("view_type", "") or "").strip()
+    if view_type not in ("diff", "html", "block_kit"):
+        return web.json_response(
+            {"error": "invalid view_type", "code": "invalid_view_type"}, status=400
+        )
+    callback = getattr(state, "_set_code_channel_view", None)
+    if callback is None:
+        return web.json_response(
+            {"error": "code channels unavailable (Slack not running)", "code": "slack_unavailable"},
+            status=503,
+        )
+    # The caller's verified session key (the X-Session-Key header every MCP
+    # subprocess sends) is how the orchestrator finds the code channel this session
+    # is working in — the view is published there, not to any channel the caller names.
+    caller_session_key = request.headers.get("X-Session-Key", "").strip()
+    result = await callback(
+        caller_session_key,
+        view_type,
+        body.get("content"),
+        body.get("blocks"),
+        body.get("name"),
+        body.get("view_key"),
+    )
+    if not result.get("ok"):
+        err = result.get("error") or "view_failed"
+        # not_a_code_channel = caller's session isn't a code channel (client error);
+        # slack_unavailable = capability absent; anything else = a Slack-side failure.
+        # Literal statuses per branch so the error-code contract statically verifies each.
+        if err == "not_a_code_channel":
+            return web.json_response(
+                {"error": f"could not set view: {err}", "code": err}, status=409
+            )
+        if err in ("slack_unavailable", "code_channels_off"):
+            return web.json_response(
+                {"error": f"could not set view: {err}", "code": err}, status=503
+            )
+        return web.json_response({"error": f"could not set view: {err}", "code": err}, status=502)
+    return web.json_response({"ok": True})
+
+
+async def api_publish_plan_canvas(request: web.Request) -> web.Response:
+    """POST /api/publish-plan-canvas — publish_plan_canvas MCP tool transport.
+
+    Creates (or, when ``canvas_id`` is given, updates) a comment-only plan canvas
+    and attaches it as a view tab in the code channel the caller's session is bound
+    to. MCP/internal-secret only (on ``_STRICT_INTERNAL_API_PATHS``); the tool has
+    already resolved a strict session key. The orchestrator resolves the target
+    channel FROM that session and refuses unless it is a known code channel, so the
+    agent can only publish into the code channel it is actually working in.
+
+    Body: ``{"content": str, "title"?: str, "canvas_id"?: str, "view_name"?: str}``.
+    Returns ``{"ok": true, "canvas_id": str, "updated": bool}``; a non-2xx JSON body
+    carries a machine-readable ``code`` field.
+    """
+    state: DashboardState = request.app["state"]
+    # Internal-secret ONLY — this posts to Slack. request["internal_auth"] is set
+    # solely on the validated X-Internal-Secret path the MCP gateway uses; the
+    # strict-internal middleware would otherwise also admit loopback cookie callers.
+    if not request.get("internal_auth"):
+        return web.json_response(
+            {"error": "internal-secret authentication required", "code": "auth_required"},
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    content = str(body.get("content", "") or "")
+    if not content.strip():
+        return web.json_response(
+            {"error": "content required", "code": "content_required"}, status=400
+        )
+    callback = getattr(state, "_publish_plan_canvas", None)
+    if callback is None:
+        return web.json_response(
+            {"error": "code channels unavailable (Slack not running)", "code": "slack_unavailable"},
+            status=503,
+        )
+    # The caller's verified session key (the X-Session-Key header every MCP
+    # subprocess sends) is how the orchestrator finds the code channel this session
+    # is working in — the canvas is published there, not to any channel the caller names.
+    caller_session_key = request.headers.get("X-Session-Key", "").strip()
+    result = await callback(
+        caller_session_key,
+        content,
+        body.get("title"),
+        body.get("canvas_id"),
+        body.get("view_name"),
+    )
+    if not result.get("ok"):
+        err = result.get("error") or "canvas_failed"
+        # not_a_code_channel = caller's session isn't a code channel (client error);
+        # slack_unavailable = capability absent; anything else = a Slack-side failure
+        # (canvas_not_found, missing_scope, canvas_creation_failed, ...).
+        # Literal statuses per branch so the error-code contract statically verifies each.
+        # canvas_not_owned = canvas_id is not one this tool created in the caller's
+        # code channel (client error); code_channels_off = the feature is off.
+        if err in ("not_a_code_channel", "canvas_not_owned"):
+            return web.json_response(
+                {"error": f"could not publish canvas: {err}", "code": err}, status=409
+            )
+        if err in ("slack_unavailable", "code_channels_off"):
+            return web.json_response(
+                {"error": f"could not publish canvas: {err}", "code": err}, status=503
+            )
+        return web.json_response(
+            {"error": f"could not publish canvas: {err}", "code": err}, status=502
+        )
+    return web.json_response(
+        {"ok": True, "canvas_id": result.get("canvas_id"), "updated": result.get("updated")}
+    )
+
+
 def _code_channel_origin_for_caller(
     request: web.Request, body: dict, state: Any
 ) -> tuple[str, str] | None:
