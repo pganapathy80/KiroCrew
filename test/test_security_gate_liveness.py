@@ -116,12 +116,17 @@ def _url_payload_command(n: int) -> str:
 #: are independent additions to the same ratchet, so the number below is re-MEASURED
 #: off the tree rather than being the arithmetic sum of the deltas.
 #:
+#: Raised again, from 27,863, for the write-protected entry covering the Slack
+#: code-channel record (``slack-code-channels.json``): a code channel's recorded origin
+#: is where the gateway posts back to for it, tracked or not, and the gateway restores the
+#: record at start, so a session must not be able to forge one. One entry plus its reason.
+#:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 27_863
+_PACKAGE_LINE_BUDGET = 27_871
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

@@ -742,6 +742,16 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # Gateway resolve-once artifacts choose the entry point substituted for an
     # approved npm launcher. The installer runs in the unsandboxed gateway.
     "mcp/resolved",
+    # The Slack code-channel record (``slack.code_channel_store``). An input to an
+    # authorization decision: a code channel's recorded origin is where the gateway
+    # posts back to for it, tracked or not, and the gateway restores the record at
+    # start, so a sandboxed writer could forge an origin and have the gateway post
+    # anywhere after a restart. Read-only, not hidden: it holds channel ids, repo
+    # paths and timestamps, no secret. Its only writer is the gateway, outside the
+    # sandbox. Paired with the file-edit floor in
+    # ``security.paths._WRITE_PROTECTED_HOME_PATHS``, and pre-created (see
+    # ``_CREW_PRECREATE_READONLY_FILE_LEAVES``) so the mount seal has a file to bind.
+    "slack-code-channels.json",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
@@ -979,6 +989,10 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # Launch trees and records contain no credential. Their integrity is enforced
     # by the read-only mount; foreign harnesses may read the resolved package tree.
     "mcp/resolved",
+    # Channel ids, repo paths and timestamps, no credential; the decision it feeds
+    # (where the gateway posts back to for a code channel) is made by the gateway
+    # outside any sandbox, never by a child reading it.
+    "slack-code-channels.json",
 )
 
 
@@ -1460,6 +1474,10 @@ def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool
 #:      materialising: it is written only once a claude-agent-acp session has
 #:      actually seeded a work dir, so on every install that has not it is exactly
 #:      the absent-and-therefore-writable name this list exists to close.
+#:    * ``slack-code-channels.json`` — ``slack.code_channel_store._load`` finds no
+#:      ``channels`` mapping in ``{}`` and restores no record, so no code channel
+#:      gains an origin. Identical to absent, and absent on every install that has
+#:      never opened a code channel.
 #:
 #: 2. A STALE read of that empty document must fail toward refusal. The seal is a
 #:    bind mount, which pins the INODE for the sandbox's lifetime, while every
@@ -1658,6 +1676,12 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # narrower than the truth (criterion 2).
     "credential_redaction.json",
     "settings_seeds.json",
+    # The Slack code-channel record, pre-created for the same absent-file reason:
+    # it is written only once a code channel exists, so without this entry the
+    # mount seal skips it on every install that has none, leaving the name
+    # creatable from inside the namespace sandbox. ``{}`` restores no record
+    # (criterion 1), and no sandboxed process reads it (criterion 2 is moot).
+    "slack-code-channels.json",
     # The cloud launcher's config, and the leaf where an ABSENT file is the more
     # dangerous case: with no file there is no seal, so an agent could CREATE the
     # whole ``fargate`` block -- its own image beside the owner's real secret ARNs --

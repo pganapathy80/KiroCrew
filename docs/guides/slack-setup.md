@@ -317,6 +317,53 @@ To suppress a single phase (keep the others at their defaults), set it to `null`
 
 A suppressed phase removes any prior reaction but adds nothing new; stall reactions (`🥱` / `😨`) are unaffected.
 
+### Code Channels (beta)
+
+Code channels are dedicated per-task Slack channels with a context bar (repo,
+branch, PR) and view tabs (diff, HTML, Block Kit). They are a Slack partner beta and
+are off by default. The shipped manifest leaves them out, so installs that do not use
+them are not asked for the extra scopes. To turn them on:
+
+1. Slack has to flag your workspace or org for the code-channels pilot. An ordinary
+   workspace is not enough.
+2. Add these entries to your app's manifest (**App Manifest** in the Slack app
+   settings):
+
+   ```yaml
+   features:
+     code_channels:
+       enabled: true
+   oauth_config:
+     scopes:
+       bot:
+         - code_channels:manage      # all agents.conversations.* calls
+         - channels:write.invites    # invite collaborators (public channels)
+         - groups:write.invites      # invite collaborators (private channels)
+   ```
+
+   No extra event subscription is needed: `message.channels` and `message.groups`
+   already deliver code-channel messages.
+3. Reinstall the app (**Settings → Install App → Reinstall to Workspace**) so the new
+   scopes are granted.
+4. Turn the feature on in `~/.kiro/crew/config.json`:
+
+   ```json
+   {
+     "slack": {
+       "code_channels": true
+     }
+   }
+   ```
+
+The repo, invitee and context-bar settings (`code_channel_repo`,
+`code_channel_invitees`, `code_channel_context_items`) are described in
+[Slack Integration: Code Channels](../../src/kiro_crew/docs/slack-integration.md#code-channels-beta).
+
+To check it, run `/<command> codechannel test` in a channel the bot is in. A new
+private channel should open with a kickoff message; close it with its
+**Archive with summary** button. If you get `feature_disabled` or `missing_scope`
+instead, see [Troubleshooting](#troubleshooting).
+
 ---
 
 ## Reusing the App in Another Workspace
@@ -461,6 +508,9 @@ The slash command name is configurable via `slack.command` in config (default: `
 | `/<command> sessions` | List recent sessions with resume buttons |
 | `/<command> status` | Show runtime stats |
 | `/<command> restart` | Restart the gateway (owner-only) |
+| `/<command> codechannel <task>` | Create a private code channel for a task (beta, see [Code Channels](#code-channels-beta)) |
+| `/<command> archive [summary]` | Post the summary and archive the code channel it is run in. With no summary it writes one from the session summary or the change |
+| `/<command> rename <title>` | Rename the code channel it is run in, when Kiro Crew owns it |
 | `/<command> #channel` | Track or untrack a channel |
 
 Any unrecognized sub-command prints the same list, generated from the live
@@ -541,6 +591,8 @@ to end just one browser's session, sign out in that browser
 | No events received | Verify Socket Mode is ON, events are subscribed, App Home Chat Tab is enabled. Reinstall app after changes |
 | Home tab is blank | Add `app_home_opened` event, enable Home Tab, reinstall app |
 | `missing_scope` error | Add the scope in OAuth & Permissions, reinstall app, re-run `kirocrew setup --slack` |
+| `/<command> codechannel` reports `feature_disabled` | Code channels are not enabled for this app: the workspace needs Slack's code-channels pilot and the manifest needs `features.code_channels.enabled: true`. See [Code Channels](#code-channels-beta), then reinstall app |
+| `/<command> codechannel` reports `missing_scope` | Add `code_channels:manage` and the invite scopes from [Code Channels](#code-channels-beta), reinstall app |
 | Bot doesn't respond | Check `kirocrew doctor` output. Ensure gateway is running (`kirocrew gateway`) |
 | Install needs approval | Your workspace restricts app installs, so a workspace admin must approve, or use a workspace you own |
 | Dashboard shows 403 | Token expired, IP changed, or the link was opened more than 5 minutes after it was issued. Run `!dashboard` for a new link |

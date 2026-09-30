@@ -32,6 +32,10 @@ def _make_orch(
     orch._cfg = cfg
     orch.channel_history = MagicMock()
     orch.slack = MagicMock()
+    # _route_message awaits is_code_channel on a mention-mode channel to detect a
+    # code channel and upgrade it to always-on; a bare MagicMock returns a
+    # non-awaitable, so pin it as an async no (this test uses ordinary channels).
+    orch.slack.is_code_channel = AsyncMock(return_value=False)
     orch.sessions = AsyncMock()
     orch.sessions.enqueue = MagicMock(return_value=False)
     # Sync accessor on an AsyncMock: left unset it returns a truthy coroutine,
@@ -246,6 +250,61 @@ class TestChannelActivationRouting:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 call_kwargs = mock_hm.call_args[1]
                 assert call_kwargs["channel_agent"] == "ops"
+
+
+class TestCodeChannelActivationFlag:
+    """Code-channel detection and the always-on upgrade belong to the opt-in
+    ``slack.code_channels`` feature: with the flag off neither runs."""
+
+    @staticmethod
+    def _orch(*, flag: bool) -> MagicMock:
+        orch = _make_orch()
+        orch._cfg.slack.code_channels = flag
+        orch.slack.is_code_channel = AsyncMock(return_value=True)
+        orch.slack.code_channel_agent_ids = AsyncMock(return_value=None)
+        orch._code_channels = set()
+        orch._owned_code_channels = set()
+        return orch
+
+    @staticmethod
+    async def _route(orch: MagicMock, text: str = "hello") -> AsyncMock:
+        event = {"user": "U1", "channel": "C_CC", "text": text, "ts": "9.0", "team": "TTEST"}
+        with patch("kiro_crew.slack.events.handle_message", new_callable=AsyncMock) as mock_hm:
+            with patch("kiro_crew.slack.events.is_allowed_user", return_value=True):
+                with patch("kiro_crew.slack.events._CODE_CHANNEL_CACHE", {}):
+                    await _route_message(orch, event, SeenCache(), is_mention=False)
+                    await asyncio.sleep(0)
+                    await asyncio.gather(*list(orch._handler_tasks), return_exceptions=True)
+        return mock_hm
+
+    @pytest.mark.asyncio
+    async def test_flag_off_makes_no_detection_call_and_tracks_nothing(self):
+        orch = self._orch(flag=False)
+        mock_hm = await self._route(orch)
+        orch.slack.is_code_channel.assert_not_awaited()
+        assert orch._code_channels == set()
+        assert orch._owned_code_channels == set()
+        # The mention-mode channel keeps its activation: a plain message is ignored.
+        mock_hm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_flag_off_ignores_a_restored_owned_record(self):
+        """A record written while the flag was on does not make the channel
+        always-on once the flag is off."""
+        orch = self._orch(flag=False)
+        orch._code_channels = {"C_CC"}
+        orch._owned_code_channels = {"C_CC"}
+        mock_hm = await self._route(orch)
+        mock_hm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_flag_on_detects_and_upgrades_an_owned_channel(self):
+        orch = self._orch(flag=True)
+        mock_hm = await self._route(orch)
+        orch.slack.is_code_channel.assert_awaited()
+        assert "C_CC" in orch._code_channels
+        assert "C_CC" in orch._owned_code_channels
+        mock_hm.assert_called_once()
 
 
 class TestTransportGateReviewMode:

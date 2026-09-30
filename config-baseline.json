@@ -4734,6 +4734,10 @@
         "show_thinking": true,
         "dm_single_session": false,
         "home_tab_sessions_per_kind": 5,
+        "code_channels": false,
+        "code_channel_invitees": [],
+        "code_channel_repo": "",
+        "code_channel_context_items": [],
         "sessions_limit": 10,
         "use_tunnel_url": false,
         "session_folder": ""
@@ -5010,6 +5014,98 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 5
+    },
+    {
+      "path": "slack.code_channels",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "Code Channels",
+      "help": "Enable Slack code channels (agents.conversations.*): dedicated per-task channels with a context bar and diff/view tabs. Slack partner beta — the workspace must be feature-flagged by Slack for the code-channels pilot and the app reinstalled with the code_channels:manage scope, or the API returns feature_disabled / missing_scope. Default off; safe to leave off.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "slack.code_channel_invitees",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "Code Channel Invitees",
+      "help": "Slack user/bot IDs to auto-invite when the agent creates a code channel (e.g. a collaborating agent's bot). The human who triggered the investigation is invited automatically; list additional collaborators here. Requires code_channels enabled.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "slack.code_channel_invitees.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "slack.code_channel_repo",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "Code Channel Repo",
+      "help": "Absolute path to a git repo whose context bar (repo/branch) and diff view tab the gateway auto-posts in a code channel it created — at creation and again when the agent finishes a turn there. Empty (default) disables this chrome entirely (no-op). Requires code_channels enabled.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "slack.code_channel_context_items",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "Code Channel Context Bar Items",
+      "help": "Extra context-bar items to pin at the top of a code channel the gateway created, appended after the auto-derived repo/branch items. Each item is an object with a stable 'key', a 'label', an 'icon' (one of: folder, branch, hierarchy, life-ring, link, globe, terminal, code, search, lock), and an optional 'url' to make it a clickable link (e.g. a live app URL, a PR link, a CI/status item). Slack's context bar holds at most 5 items total, so items beyond the cap (after repo/branch) are dropped. Requires code_channels enabled.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "slack.code_channel_context_items.*",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "slack.sessions_limit",

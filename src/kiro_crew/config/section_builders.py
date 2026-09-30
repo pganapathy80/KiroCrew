@@ -671,6 +671,53 @@ def _build_computer_use_config(computer_use_data: dict) -> ComputerUseConfig:
 # ---------------------------------------------------------------------------
 
 
+# Valid context-bar icon names, the set Slack's code-channel properties accept. An
+# item with an unrecognized icon is dropped rather than sent, since Slack rejects
+# unknown icons.
+_CONTEXT_BAR_ICON_NAMES = frozenset(
+    {
+        "folder",
+        "branch",
+        "hierarchy",
+        "life-ring",
+        "link",
+        "globe",
+        "terminal",
+        "code",
+        "search",
+        "lock",
+    }
+)
+
+
+def _sanitize_context_bar_items(raw: object) -> list[dict]:
+    """Coerce configured code-channel context-bar items to well-formed entries.
+
+    Each item is an object ``{key, label, icon, url?}`` pinned to the top of a code
+    channel (Slack ``agents.conversations.setProperties`` → ``context_bar_items``).
+    Items that are not objects, lack a non-empty string ``key``/``label``, or carry
+    an icon outside ``_CONTEXT_BAR_ICON_NAMES`` are dropped rather than forwarded,
+    because Slack rejects malformed items. ``url`` is optional and, when present and
+    a string, makes the item a clickable link. The 5-item total cap is enforced
+    later at post time (repo/branch are prepended before these).
+    """
+    out: list[dict] = []
+    for item in _safe_list(raw):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        label = str(item.get("label") or "").strip()
+        icon = str(item.get("icon") or "").strip()
+        if not key or not label or icon not in _CONTEXT_BAR_ICON_NAMES:
+            continue
+        entry: dict = {"key": key, "label": label, "icon": icon}
+        url = item.get("url")
+        if isinstance(url, str) and url.strip():
+            entry["url"] = url.strip()
+        out.append(entry)
+    return out
+
+
 def _build_slack_config(slack_data: dict) -> SlackConfig:
     return SlackConfig(
         session_folder=_coerce_session_folder(slack_data.get("session_folder")),
@@ -703,6 +750,16 @@ def _build_slack_config(slack_data: dict) -> SlackConfig:
         dm_single_session=bool(slack_data.get("dm_single_session", False)),
         home_tab_sessions_per_kind=_safe_int(slack_data.get("home_tab_sessions_per_kind", 5), 5),
         sessions_limit=_safe_int(slack_data.get("sessions_limit", 10), 10),
+        code_channels=bool(slack_data.get("code_channels", False)),
+        code_channel_invitees=[
+            u
+            for u in _safe_list(slack_data.get("code_channel_invitees"))
+            if isinstance(u, str) and u
+        ],
+        code_channel_repo=str(slack_data.get("code_channel_repo") or "").strip(),
+        code_channel_context_items=_sanitize_context_bar_items(
+            slack_data.get("code_channel_context_items")
+        ),
     )
 
 

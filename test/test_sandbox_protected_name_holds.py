@@ -314,7 +314,11 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 253, "cc": 260, "strict": 261}
+    #:
+    #: ``slack-code-channels.json`` -- the Slack code-channel record, sealed
+    #: read-only because a code channel's recorded origin is where the gateway posts
+    #: back to for it. Another data-home root leaf, three entries per tier.
+    EXPECTED: dict[str, int] = {"standard": 256, "cc": 263, "strict": 264}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

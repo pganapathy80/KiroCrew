@@ -2922,3 +2922,23 @@ class TestHandleSlashRespondBlocks:
         finally:
             ev.SLASH_REGISTRY.pop("zzcovnourl", None)
         assert posted == []
+
+
+class TestHandleMessageDeletedInCodeChannel:
+    @pytest.mark.asyncio
+    async def test_queued_code_channel_message_is_cancelled_under_the_anchor(self, _mock_sel):
+        """A top-level code-channel message is queued under the channel's session
+        anchor, so its delete must cancel it there, not under its own ts."""
+        orch = _make_orch()
+        orch._cfg.slack.code_channels = True
+        orch._code_channels = {"C_CC"}
+        orch._code_channel_session_ts = {"C_CC": "1700.1"}
+        orch.sessions.cancel_queued = MagicMock(return_value=True)
+        event = {
+            "deleted_ts": "1700.5",
+            "channel": "C_CC",
+            "previous_message": {"user": "U_OWNER"},
+        }
+        with patch("kiro_crew.slack.events.is_allowed_user", return_value=True):
+            await ev._handle_message_deleted(orch, event)
+        orch.sessions.cancel_queued.assert_called_once_with("1700.1", "1700.5")

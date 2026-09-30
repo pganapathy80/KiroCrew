@@ -66,6 +66,7 @@ from kiro_crew.slack.handler import (
     get_orch_cfg,
     is_slack_session_trusted,
     is_thread_temporary,
+    is_tracked_code_channel,
     maybe_apply_privacy_modifiers,
     maybe_handle_keyword_command,
     maybe_route_linked_thread,
@@ -181,6 +182,37 @@ async def _refresh_dashboard_tab(session_key: str) -> None:
         )
 
 
+def _code_channel_post_ts(
+    is_code_channel: bool, user_thread_ts: str | None, reply_ts: str
+) -> str | None:
+    """The thread_ts replies in *channel* are posted under.
+
+    In a code channel the session is one continuous top-level conversation, so
+    replies and streams are posted top-level (thread_ts omitted) and setStatus
+    must carry no thread_ts (Slack rejects it there). Return None to post at the
+    top level, but only when the user did NOT explicitly thread; a user-started
+    thread is still honoured. Everywhere else, post under ``reply_ts``.
+    """
+    return None if (is_code_channel and not user_thread_ts) else reply_ts
+
+
+def _session_ts(gateway: Any, channel: str, thread_ts: str | None, msg_ts: str) -> str:
+    """The ts a Slack message's session is keyed on.
+
+    A threaded message keys on its thread and a top-level one on itself, except in
+    a code channel, where every message continues that channel's one session (the
+    gateway's anchor for it). Without a gateway that answers, this is
+    ``thread_ts or msg_ts``.
+    """
+    own = thread_ts or msg_ts
+    lookup = getattr(gateway, "code_channel_session_ts", None)
+    if callable(lookup):
+        anchor = lookup(channel, own)
+        if isinstance(anchor, tuple) and isinstance(anchor[0], str) and anchor[0]:
+            return anchor[0]
+    return own
+
+
 def flat_dm_session_key(channel: str, thread_ts: str | None, *, enabled: bool) -> str | None:
     """The channel-scoped session key a direct message belongs to.
 
@@ -257,13 +289,23 @@ async def handle_message_transport(
     # canonical namespaced form (registry, conversation log, thread overrides
     # shared with handler.py module dicts).
     reply_ts = thread_ts or msg_ts
-    session_key = canonical_key(reply_ts)
+    # session_ts is the ts the SESSION is keyed and looked up on (the thread
+    # index); reply_ts stays the ts replies, status and reactions target. They
+    # differ only for a message in a code channel, which continues the channel's
+    # one session (its anchor ts) instead of opening a new session keyed on its
+    # own ts.
+    session_ts = _session_ts(gateway, channel, thread_ts, msg_ts)
+    session_key = canonical_key(session_ts)
 
     # Where the CONVERSATION is posted, which a flat DM separates from reply_ts:
-    # None means channel root. reply_ts keeps its thread-index meaning either way
-    # (it is still a real Slack timestamp, and still what the reverse index and
-    # the reaction target are keyed by), so only the posting half moves.
-    post_thread_ts: str | None = reply_ts
+    # None means channel root. reply_ts keeps its meaning either way (it is still
+    # a real Slack timestamp, and still what the reaction target is keyed by), so
+    # only the posting half moves. A code channel is one continuous top-level
+    # session: replies and streams post top-level, and Slack REJECTS a thread_ts
+    # on agents.sessions.setStatus there with thread_ts_not_allowed. A thread the
+    # user started in it is still answered in that thread.
+    _is_code_channel = gateway is not None and is_tracked_code_channel(gateway, channel)
+    post_thread_ts: str | None = _code_channel_post_ts(_is_code_channel, thread_ts, reply_ts)
     _flat_key = flat_dm_session_key(channel, thread_ts, enabled=dm_single_session)
     if _flat_key:
         session_key = _flat_key
@@ -300,7 +342,7 @@ async def handle_message_transport(
         """
         nonlocal session_key, linked_session_key
         while True:
-            owner = sessions.get_session_for_thread(reply_ts)
+            owner = sessions.get_session_for_thread(session_ts)
             # A flat DM ignores a SELF-DERIVED owner. ``slack:<reply_ts>`` is the
             # per-thread session this feature exists to stop splitting off, and a
             # thread claimed before the flag was turned on (owner == that key), or
@@ -309,7 +351,7 @@ async def handle_message_transport(
             # channel-scoped ``_flat_key`` already in ``session_key`` and register
             # no thread link. Any OTHER owner is a real binding elsewhere (a
             # dashboard send-to-Slack), which still wins through the loop below.
-            if _flat_key and (owner is None or owner == canonical_key(reply_ts)):
+            if _flat_key and (owner is None or owner == canonical_key(session_ts)):
                 # Pin ``session_key`` back to ``_flat_key`` and do not reroute.
                 # The reset is not redundant: an EARLIER _resolve_thread_owner
                 # call in this turn may have moved session_key to a real
@@ -319,7 +361,7 @@ async def handle_message_transport(
                 # session -- otherwise its context would be posted to Slack.
                 # ``linked_session_key`` still mirrors the CURRENT thread-owner
                 # reading (``owner``), because the pre-acquisition stability loop
-                # compares it against a fresh ``get_session_for_thread(reply_ts)``
+                # compares it against a fresh ``get_session_for_thread(session_ts)``
                 # to decide it may proceed -- forcing it to None would never equal
                 # that reading and spin forever. The self-link write downstream is
                 # separately gated on ``not _flat_key``, so a flat DM still
@@ -327,13 +369,13 @@ async def handle_message_transport(
                 session_key = _flat_key
                 linked_session_key = owner
                 return
-            candidate_key = owner or canonical_key(reply_ts)
+            candidate_key = owner or canonical_key(session_ts)
             if candidate_key != session_key:
                 await _hydrate_thread_overrides(candidate_key, conversation_log)
                 # The worker read may yield to a new thread owner. Resolve that
                 # owner before publishing either routing key; cached hydration
                 # returns without yielding when an owner is already known.
-                if sessions.get_session_for_thread(reply_ts) != owner:
+                if sessions.get_session_for_thread(session_ts) != owner:
                     continue
                 _hydrate_conv_flags(sessions, candidate_key)
                 logger.info(
@@ -409,7 +451,7 @@ async def handle_message_transport(
     # Shared with native handle_message so a thread linked via
     # /kirocrew link-to-dashboard routes into its dashboard slot (with the same
     # auth recheck + bang fall-through) instead of spawning a fresh session.
-    if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, reply_ts):
+    if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, session_ts):
         return
 
     # ── Hook: auto-reply before touching the LLM (mirrors native) ──
@@ -521,7 +563,7 @@ async def handle_message_transport(
     # under the wrong key silently no-ops and leaves the control clickable.
     await expire_slack_options(
         cast("DashboardState | None", get_dashboard_state()),
-        sessions.get_session_for_thread(reply_ts) or session_key,
+        sessions.get_session_for_thread(session_ts) or session_key,
     )
 
     client: LLMProvider | None = None
@@ -592,10 +634,10 @@ async def handle_message_transport(
             try:
                 _memory_store = await session_store_for_turn(context_builder, session_key)
             except UnknownMemoryStore:
-                if sessions.get_session_for_thread(reply_ts) != owner_before_memory:
+                if sessions.get_session_for_thread(session_ts) != owner_before_memory:
                     continue
                 raise
-            if sessions.get_session_for_thread(reply_ts) == owner_before_memory:
+            if sessions.get_session_for_thread(session_ts) == owner_before_memory:
                 break
         if decider is not None:
             # The decider was constructed with the pre-reroute key, and that key
@@ -642,14 +684,14 @@ async def handle_message_transport(
         # read below.
         await expire_slack_options(
             cast("DashboardState | None", get_dashboard_state()),
-            sessions.get_session_for_thread(reply_ts) or session_key,
+            sessions.get_session_for_thread(session_ts) or session_key,
         )
         if is_new:
             await sessions.set_channel(session_key, channel)
         if (
             not _flat_key
             and not linked_session_key
-            and not sessions.get_session_for_thread(reply_ts)
+            and not sessions.get_session_for_thread(session_ts)
         ):
             # Three conditions, deliberately. The first excludes a flat DM: its
             # session is keyed by the channel, not by a thread, so binding it to
@@ -670,9 +712,9 @@ async def handle_message_transport(
             # STILL unclaimed; the turn itself continues on the session we
             # already acquired.
             #
-            # reply_ts (not session_key) is the true Slack timestamp -- storing
+            # session_ts (not session_key) is the true Slack timestamp -- storing
             # the namespaced key as slack_thread_ts would corrupt reply routing.
-            sessions.set_slack_link(session_key, reply_ts, channel)
+            sessions.set_slack_link(session_key, session_ts, channel)
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await publish_turn_identity(sessions, session_key)
@@ -863,7 +905,7 @@ async def handle_message_transport(
         # A dashboard link landing during the run moves the conversation to a
         # different session, which makes any control this turn posts stale the
         # instant it lands — compared after the run below.
-        _pre_run_owner = sessions.get_session_for_thread(reply_ts) or session_key
+        _pre_run_owner = sessions.get_session_for_thread(session_ts) or session_key
 
         # Persisting-and-stamping is handed to the renderer because the token has
         # to be inside the footer it is about to post, and the footer is posted
@@ -948,7 +990,7 @@ async def handle_message_transport(
             # key — so recording under the old one files it where nothing
             # will ever find it, leaving the control clickable into a
             # question the conversation has already passed.
-            _options_owner = sessions.get_session_for_thread(reply_ts) or session_key
+            _options_owner = sessions.get_session_for_thread(session_ts) or session_key
             remember_slack_options(
                 cast("DashboardState | None", get_dashboard_state()),
                 _options_owner,

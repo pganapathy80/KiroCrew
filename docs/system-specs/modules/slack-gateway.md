@@ -160,6 +160,7 @@ Slack Socket Mode → events.py (dispatch) → handler.py → SessionManager →
 | `slack/interactions.py` | Block Kit button routing — tool approval, OPTIONS choices, cron/subagent ack, allowlist approve/deny, track channel approve/deny |
 | `slack/blocks.py` | Reusable Block Kit dict builders for slash command UIs (session list, send-to-slack). Action IDs: `mc_<command>_<action>[_<id>]` |
 | `slack/allowlist.py` | Tracking-channel allowlist prompts (`prompt_allowlist`, `prompt_track_channel`) + config persistence (`persist_allowed_user`, `persist_tracking_channel`) |
+| `slack/code_channel_store.py` | On-disk record per code channel (repo, diff baseline, origin, session anchor, ownership) in `slack-code-channels.json`, so a gateway restart restores it (`restore_into` / `save_channel` / `forget_channel`) |
 | `slack/scope_probe.py` | Tracked-channel history-readability probe (`warn_unreadable_tracked_channels`) — warns when the installed token cannot read a tracked channel (e.g. a private channel on an install predating `groups:history`) |
 | `slack/enterprise.py` | Enterprise Grid workspace validation — `validate_enterprise()` (startup auth.test + cache) + `check_message_origin()` (per-message team_id check). SEL audit on all outcomes. See V2160269460 |
 | `slack/channel_resolver.py` | Channel ID → human-readable name resolution (in-memory + on-disk cache), because `ChannelConfig` stores no name field |
@@ -191,6 +192,9 @@ agent-session lifecycle (see Agent sessions below). It replaces the deprecated
 `assistant_view`, which Slack retires in Feb 2027. On top of the message and mention
 events, the manifest subscribes to the agent-session bot events `app_context_changed`,
 `agent_session_stopped` and `agent_session_title_changed`.
+
+The code-channel entries are opt-in and not in the bundled manifest (see Code
+channels below).
 
 The manifest also requests user scopes `channels:history`, `channels:read`,
 `groups:history`, `groups:read`, `im:history`, `im:read`, `mpim:history`,
@@ -419,6 +423,170 @@ stays subscribed because Slack's agent setup guide lists it among the bot events
 `agent_view` app subscribes to; the gateway does not act on it, since the message
 events carry the context it uses.
 
+### Code channels (`agents.conversations.*`, Slack partner beta)
+
+`create_code_channel`, `archive_code_channel`, `set_code_channel_properties` (the
+context bar, at most 5 items), `set_code_channel_view` (diff, html or block_kit tabs),
+`code_channel_agent_ids` and `is_code_channel` (reads
+`properties.record_channel.record_type == "agent_channel"`) wrap Slack's beta
+code-channel API. All of it sits behind the default-off `slack.code_channels` config
+flag. The API only answers when Slack has flagged the workspace for the code-channels
+pilot and the app has been reinstalled with the `code_channels:manage` scope; without
+both, calls return `feature_disabled` or `missing_scope` and fail cleanly. None of the
+code-channel manifest entries are in the bundled manifest, because they would widen
+consent for every install: a pilot operator adds `features.code_channels.enabled: true`
+and the bot scopes `code_channels:manage` and `channels:write.invites` /
+`groups:write.invites` (to invite collaborators into public and private channels) by
+hand, as the setup guide lists. No extra event subscription is needed:
+`message.channels` and `message.groups` already deliver code-channel messages. A failed
+call leaves Slack's error code on the client's `_last_code_channel_error`, held per
+asyncio task so two failures in different sessions each read their own code.
+
+`/kirocrew codechannel <task>` creates the channel **private** (`is_private=True`),
+invites the caller plus `slack.code_channel_invitees` (`invite_users`, which calls
+`conversations.invite`), posts a **Block Kit kickoff** (task header, participants,
+the collaboration protocol and an "Archive with summary" button) and tracks the channel
+in `GatewayOrchestrator._code_channels`. `/kirocrew archive [summary]` posts a summary
+and then calls `archive_code_channel(summary_message_ts=...)`. The kickoff's archive
+button (`action_id=code_channel_archive`, handled in `slack/interactions.py`) runs the
+same path. Both refuse before posting anything when the channel is not a code channel,
+and with `slack.code_channels` off both are inert: the command answers that code
+channels are off and the button makes no Slack call (it is audited as denied with
+`code_channels_off`). `/kirocrew rename <title>` renames the code channel it is run in
+with `rename_session` and `thread_ts=None` (a code channel is one session, and
+`agents.sessions.rename` rejects `thread_ts` there). It refuses outside a code channel,
+and in a code channel this Kiro Crew does not own (`_owned_code_channels`, the same
+record that decides always-on), so a channel another agent is in charge of keeps the
+title that agent gave it.
+
+**Archive summary.** `/kirocrew archive <text>` archives with the user's text. The
+button and a bare `/kirocrew archive` share `events.code_channel_archive_summary`,
+and the text it returns is posted both in the channel and back to the origin thread
+(`_post_summary_to_origin`). It takes, in order:
+
+1. the cached session summary of the channel's session (the `.intents` sidecar of
+   `canonical_key(anchor)`, see [session-summary](session-summary.md)), as up to
+   `_ARCHIVE_SUMMARY_MAX_INTENTS` intent titles with their state. It is read only: no
+   generation starts and no model is called. It is read inside the transcript's
+   `derivation_hold` and skipped when `transcript_withholds_derivation` says the
+   transcript is restricted; a stale summary is still used, as the panel shows it;
+2. otherwise a change summary from `git diff --numstat` against the diff baseline the
+   diff tab uses (`_code_channel_diff_base`, else plain `git diff`) in the channel's
+   repo: the file count, added and removed lines, and up to `_ARCHIVE_SUMMARY_MAX_FILES`
+   file names;
+3. otherwise `ARCHIVE_SUMMARY_DEFAULT` ("Session complete.").
+
+The first two come from transcripts and file names, so their Slack markup is escaped
+(`escape_mrkdwn`). The text is capped at `_ARCHIVE_SUMMARY_MAX_CHARS` before it is
+escaped, so the clip never cuts an entity such as `&amp;` in half.
+
+The whole create-and-set-up sequence lives once in
+`events.create_code_channel_core(orch, name, caller_id)`.
+
+**Origin-thread handoff.** When the channel is created with an origin
+(`origin_channel_id` and `origin_message_ts`, the message that triggered it, for example
+another agent's root-cause write-up in the main channel), `create_code_channel_core`
+captures that whole thread with `_format_origin_handoff` (`fetch_thread_replies`,
+speakers written as bare ids so the injected text pings nobody, bounded by
+`_HANDOFF_MAX_CHARS`) and stores it on `GatewayOrchestrator._code_channel_handoff`
+keyed by channel. The first turn in the code channel gets it once as a
+`[Handoff context ...]` preamble, and then it is dropped, so the agent starts from the
+whole originating conversation rather than the one-line quote Slack shows. The thread
+is captured before the channel is created, and the channel, its origin, handoff and
+repo are registered as soon as Slack returns the channel id, before any further await:
+Slack posts its opening message into the new channel at once, and that message can
+start the first turn while the setup calls (status, config, invites, kickoff) are still
+running. This is best-effort. A fetch failure never fails creation, and the handoff is
+not persisted, so a restart before the first turn drops it.
+
+**Working context.** Each turn in a code channel starts with standing instructions
+(`_code_channel_working_context`): the channel's repo on this machine; that the agent
+owns the code change end to end (change, tests, diff) and deploys only when the task or
+someone in the channel asks; and that the conversation it was handed (the handoff and
+the channel history) is its brief, so it builds on what that conversation already
+established, such as a diagnosis, instead of redoing it unless someone asks. The
+wording does not assume a scenario: a code channel may hold a fix, a feature, a review
+or a plan, shared by any mix of people and agents. The block is for the agent only.
+Anything that shows a turn back to people (the dashboard-to-Slack echo) strips it
+(`code_channel_store.strip_code_channel_context`), so the channel shows what the person
+typed.
+
+**One session per code channel.** A code channel is one continuous session. Every
+message there, top-level or threaded, keys its session on the channel's anchor ts
+(`GatewayOrchestrator.code_channel_session_ts`, set by the first message and persisted
+in the channel record), both in the transport path (`_session_ts`) and in the busy and
+queue check, so the agent keeps its memory across messages. A deleted queued message
+is looked up under the same anchor. A stop anywhere in the channel, Slack's stop
+button or `!stop`, top-level or threaded, resolves through `_resolve_stop_target` to
+that anchor (`_code_channel_stop_anchor`), so it stops the channel's session rather
+than the thread, the clicked stream or the `!stop` message's own ts. Slack's stop
+button reaches that path only through `_dispatch_agent_session_event`, so a stop from a
+workspace outside the allowlist stops nothing in a code channel either. Where
+a reply is posted is decided separately (`_code_channel_post_ts`: top-level, or inside
+the user's own thread).
+
+- **Always-on where it is in charge:** Kiro Crew answers without an @-mention only in
+  code channels it owns (`_owned_code_channels`): ones it created (persisted
+  `activation=always` and marked owned in the channel record) and ones Slack assigns to
+  it alone (`agent_session.encoded_agent_bot_user_ids` is exactly this bot, read by
+  `code_channel_agent_ids`; an unreadable assignment or an unknown self id counts as
+  owned). In a code channel shared with other agents that it did not create, it answers
+  when addressed, like any channel. It still recognizes any code channel it sees
+  (`_detect_code_channel`, an `is_code_channel` check cached in `_CODE_CHANNEL_CACHE`)
+  for top-level posting and chrome. `is_code_channel` answers None when the lookup
+  fails; a definite answer is cached, and a failure is asked again on the next message.
+  Detection, the tracking it feeds and the always-on upgrade all run only with
+  `slack.code_channels` on. With the flag off a message makes no `conversations.info`
+  call, no channel is tracked, and a channel keeps its configured activation even if
+  a record from when the flag was on marks it owned. The records are still restored
+  at startup, so turning the flag back on loses nothing, and every code-channel
+  behaviour (top-level posting, the session anchor, the turn context and handoff, the
+  diff chrome, collaborator filtering, the dashboard's code-channel check) asks
+  `handler.is_tracked_code_channel`, which is True only for a tracked channel with the
+  flag on, never `_code_channels` membership alone.
+- **Survives a restart:** the per-channel record Slack cannot give back (the repo on
+  this machine, the diff baseline taken at open, the origin message, the session anchor
+  and ownership) is kept in `slack-code-channels.json` under the data home by
+  `slack/code_channel_store.py`. It is written at creation, dropped on archive (which
+  also clears the channel's in-memory state) and restored into the orchestrator's maps
+  at startup, in place, so references other components hold stay valid. A missing or
+  corrupt file restores nothing. Writes are serialised, and the agent cannot write the
+  file, because it is an authorization input (see the security spec). The one-shot
+  origin-thread handoff is not persisted.
+- **Top-level replies from a linked slot:** an option click in a code channel is routed
+  to the linked dashboard slot (`maybe_route_linked_thread`), whose mirror
+  (`chat_runner`) posts the echo, stream, reply and next options control.
+  `_mirror_post_thread` posts those top-level in a code channel (the gateway wires
+  `DashboardState._is_code_channel`), while the link's thread is still used for
+  ownership lookups. Other channels keep threading under the link. Action responses
+  in `slack/interactions.py` follow the same rule (`_action_reply_thread_ts`).
+- **Addressing rule:** wherever Kiro Crew would answer without an @-mention (a followed
+  thread, an owned code channel), a message that @-mentions other people or agents and
+  not Kiro Crew is theirs and is skipped (`_addressed_to_someone_else`). In a code
+  channel, with an unknown self id, it falls back to the configured
+  `code_channel_invitees`.
+- **Same context on every turn:** a button or OPTIONS answer routed to the linked
+  session (`maybe_route_linked_thread`) gets the same working context as an inbound
+  message (`code_channel_turn_preamble`, wired as
+  `DashboardState._code_channel_turn_context`); the displayed row stays the user's own
+  text.
+- **Auto chrome:** when the channel has a repo (the per-channel repo bound at creation,
+  else `slack.code_channel_repo`), `_post_code_channel_chrome` posts the context bar
+  (repo and branch) at creation and the working-tree change as a diff view tab when a
+  turn finishes (hooked in `_on_transport_done`). The diff is taken against a
+  `git stash create` snapshot of the tree from when the channel opened, so changes
+  that were already there do not show; a clean tree posts no tab. It is best-effort
+  and does nothing when no repo is set. Operators can pin extra context-bar items with
+  `slack.code_channel_context_items`, a list of `{key, label, icon, url?}` objects
+  (icon from Slack's set: `folder`, `branch`, `hierarchy`, `life-ring`, `link`,
+  `globe`, `terminal`, `code`, `search`, `lock`), added after repo and branch.
+  Malformed items are dropped when config loads, and Slack caps the bar at 5 items in
+  total, so `set_code_channel_properties` trims any past the cap.
+- **A collaborating agent whose Slack app lacks `features.code_channels.enabled`
+  cannot take part in a code channel:** Slack does not route code-channel events to
+  it. Reach such an agent in the channel the work came from, or through its own API,
+  rather than assuming an @-mention works inside a code channel.
+
 ## Per-Channel Activation Modes
 
 Each channel can have its own activation mode controlling when the bot responds:
@@ -571,6 +739,13 @@ Slack `file_share` messages are processed in `_route_message()` after dedup + au
 - Edit throttled to ~1/sec to avoid Slack rate limits (Tier 3: ~50 req/min)
 - Cursor indicator (▍) shown during streaming, removed on completion
 - Tool calls shown inline as 🔧 _tool name_
+- **Code channels reply top-level:** a code channel is one session, so the transport
+  path posts its replies with no `thread_ts` (`_code_channel_post_ts`) unless the user
+  started a thread, and the renderer takes its no-thread branch, rendering through the
+  `chat.update` placeholder the way a flat DM does. `start_stream` leaves `thread_ts`
+  out of the `chat.startStream` body when it is empty rather than sending `""`, which
+  is neither Slack's documented omission nor the accepted `"0"`; the dashboard mirror
+  relies on that when it streams into a code channel.
 - **Thinking/reasoning content** filtered from the main response — accumulated separately and posted as a 💭 thread reply after the main message. Inline `<thinking>` / `</thinking>` tags are also stripped as a safety net. The thread reply is suppressed when `slack.show_thinking` is `false` (default `true`).
 - Final message split into multiple posts if over 3900 chars (via `split_message()`)
 - **Redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder or a `security.EXFILTRATION_REDACTION_TAG_PREFIX` (suspicious-URL) placeholder, one `messaging.renderer.redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command or link they copy will not run as pasted. Worded by kind (credential → re-enter the secret; URL → re-check the link), and byte-identical to the prior `credential_redaction_notice` sentence when only credentials were rewritten. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn. The transport-path renderer (`slack/renderer.py`, the default `messaging.use_transport` delivery) posts the same one-per-turn notice: the final display-safe answer body and the posted 💭 reasoning share a single tally, counted with `messaging.renderer.count_redaction_tags` over the form the reader is left with — which can carry placeholders the driver's byte-level stream scan never wrote, because `_display_safe` re-redacts against what Slack renders

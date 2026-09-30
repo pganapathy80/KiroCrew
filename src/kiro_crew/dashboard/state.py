@@ -5645,6 +5645,14 @@ class DashboardState:
         self._mcp_gateway_apply: Any = None  # async (enabled: bool) -> dict
         self._mcp_gateway_apply_stub: Any = None  # async () -> dict
         self._mcp_resolve_refresh: Any = None  # async () -> dict
+        # Slack code-channel hooks, wired by GatewayOrchestrator after dashboard
+        # init (Slack is optional and may be absent).
+        # (channel_id) -> bool: is this a Slack code channel the gateway tracks?
+        # Mirrored replies post top-level there (Slack's code-channel rule).
+        self._is_code_channel: Any = None
+        # (channel_id) -> str: the working context a code-channel turn starts with,
+        # prepended to a Slack answer routed into the linked session.
+        self._code_channel_turn_context: Any = None
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)

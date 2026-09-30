@@ -846,6 +846,16 @@ the path directly, as keystone writers must, so it would have followed the link.
 also deliberately NOT a field on the app's `index.json`, which is agent-writable by
 design.
 
+**Slack code-channel record** (`slack-code-channels.json`, written by
+`slack/code_channel_store.py`) is write-protected on both floors: the file-edit tool gate
+(`_WRITE_PROTECTED_HOME_PATHS`) and the kernel seal (`sandbox._CREW_READONLY_LEAVES`, pre-created
+as `{}` through `_CREW_PRECREATE_READONLY_FILE_LEAVES` because the file does not exist until a
+code channel does). It holds no secret, so it stays readable. It is an **input to an
+authorization decision**: a code channel's recorded origin is the channel the gateway posts back
+to for it, even when that channel is not tracked, and the record is restored at gateway start,
+so an agent that could rewrite it could forge an origin and post anywhere after a restart. The
+gateway writes it directly, not through either gate.
+
 **Ops Mission Control authorization inputs** (`apps/ops-mission-control/data/rotation.yaml`,
 `apps/ops-mission-control/data/incidents/index.json`) — two app-owned files that are
 write-protected on both layers for the same reason as the marker above, and with the same

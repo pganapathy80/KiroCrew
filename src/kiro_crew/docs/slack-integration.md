@@ -84,6 +84,39 @@ Available to all allowed users (no `!` prefix needed):
 | `/kirocrew sessions` | List recent sessions |
 | `/kirocrew status` | Show runtime stats |
 | `/kirocrew restart` | Restart the gateway (owner only) |
+| `/kirocrew codechannel <task>` | Create a code channel for a task (beta, see below) |
+| `/kirocrew archive [summary]` | Post the summary and archive the code channel it is run in. With no summary it writes one from the session summary or the change |
+| `/kirocrew rename <title>` | Rename the code channel it is run in, when Kiro Crew owns it |
+
+## Code Channels (beta)
+
+Slack code channels are dedicated per-task channels with a context bar (repo,
+branch, PR) and view tabs (diff, HTML, Block Kit). `/kirocrew codechannel <task>`
+creates one: a private channel with you and the configured invitees in it, a kickoff
+message, and an **Archive with summary** button.
+
+The feature is a Slack partner beta and is off by default. It needs Slack's
+code-channels pilot on your workspace, `features.code_channels.enabled: true` and the
+bot scopes `code_channels:manage`, `channels:write.invites` and
+`groups:write.invites` in the app manifest (then a reinstall), and
+`slack.code_channels: true` in `config.json`. The setup guide lists the exact
+manifest lines. Without them, `/kirocrew codechannel` reports `feature_disabled` or
+`missing_scope` and nothing else changes.
+
+In a code channel Kiro Crew created, or one Slack assigns to it alone, it answers
+without being @-mentioned, but leaves a message that @-mentions only other people or
+agents to them. In a code channel shared with other agents it answers when
+addressed, like any channel. Replies go at the top level of the channel unless you
+start a thread, and every message continues the same session.
+
+Settings, all under `slack` in `config.json`:
+
+| Key | Default | What it does |
+|-----|---------|--------------|
+| `code_channels` | `false` | Turns code channels on. `{"slack": {"code_channels": true}}` |
+| `code_channel_repo` | `""` (off) | Absolute path to a git repo on this machine. In a code channel the gateway created, it shows the repo and branch in the context bar, posts the agent's change as a diff tab when a turn finishes, and tells the agent that is where the code is. `{"slack": {"code_channel_repo": "/home/me/src/myapp"}}` |
+| `code_channel_invitees` | `[]` | Slack user or bot IDs to invite into each new code channel, such as a collaborating agent's bot. Whoever started the channel is invited anyway. `{"slack": {"code_channel_invitees": ["U0123ABCD"]}}` |
+| `code_channel_context_items` | `[]` | Extra context-bar items after repo and branch. Each has a `key`, a `label`, an `icon` (`folder`, `branch`, `hierarchy`, `life-ring`, `link`, `globe`, `terminal`, `code`, `search` or `lock`) and an optional `url`. Slack shows 5 items at most, and malformed items are dropped. `{"slack": {"code_channel_context_items": [{"key": "ci", "label": "CI", "icon": "terminal"}]}}` |
 
 ## Tool Approval Flow
 

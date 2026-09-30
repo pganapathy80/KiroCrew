@@ -393,6 +393,7 @@ from kiro_crew.session_agent_selection import (
     restore_agent_selection,
     session_agent_selection_kind,
 )
+from kiro_crew.slack.code_channel_store import strip_code_channel_context
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
@@ -4848,6 +4849,20 @@ async def _deliver_cross_surface_user_message(
         logger.debug("Failed to mirror user message to %s", link.channel_type, exc_info=True)
 
 
+def _mirror_post_thread(state: Any, channel: str | None, thread_ts: str | None) -> str | None:
+    """The thread_ts a mirrored post uses in *channel*.
+
+    A Slack code channel is one top-level session, so posts there omit thread_ts
+    (``None``) even though the link still records a thread for ownership lookups.
+    Only an explicit ``True`` from the gateway-wired check counts; an unwired or
+    stand-in state threads under the link.
+    """
+    is_code_channel = getattr(state, "_is_code_channel", None)
+    if channel and callable(is_code_channel) and is_code_channel(channel) is True:
+        return None
+    return thread_ts
+
+
 def _prepare_mirror_msg(raw_user_message: str) -> str:
     """Prepare a user message for the cross-surface / Slack mirror echo.
 
@@ -4863,7 +4878,10 @@ def _prepare_mirror_msg(raw_user_message: str) -> str:
     credential the user typed with markdown between its halves is whole once the
     client renders the markup away.
     """
-    safe, _ = redact_for_display(raw_user_message or "", redact_via_context)
+    # The echo shows what the user typed, never the agent-only working context a
+    # code-channel turn is prefixed with.
+    shown = strip_code_channel_context(raw_user_message or "")
+    safe, _ = redact_for_display(shown, redact_via_context)
     return safe[:500]
 
 
@@ -13088,16 +13106,18 @@ async def _run_chat(
         if state.slack_client and not is_slash and not slack_mirror_is_paused(state, session_key):
             _mirror_thread, _mirror_chan = state.sessions.get_slack_link(session_key)
             if _mirror_thread and _mirror_chan:
+                _mirror_post_ts = _mirror_post_thread(state, _mirror_chan, _mirror_thread)
                 try:
                     if not _is_synthetic:
                         _mirror_msg = _prepare_mirror_msg(_user_msg_for_mirror)
                         await state.slack_client.post_message(
-                            _mirror_chan, f"💬 _{_mirror_msg}_", _mirror_thread
+                            _mirror_chan, f"💬 _{_mirror_msg}_", _mirror_post_ts
                         )
-                    # Start a stream for real-time tool animations
+                    # Start a stream for real-time tool animations. start_stream
+                    # omits a falsy thread_ts, so "" streams top-level.
                     _mirror_stream_ts = (
                         await state.slack_client.start_stream(
-                            _mirror_chan, _mirror_thread, initial_text="Thinking…"
+                            _mirror_chan, _mirror_post_ts or "", initial_text="Thinking…"
                         )
                         or ""
                     )
@@ -18965,8 +18985,9 @@ async def _run_chat(
                 # entirely to to_slack_mrkdwn's self-truncation.
                 _mirror_body, _mirror_options = extract_options(assistant_text)
 
+                _reply_post_ts = _mirror_post_thread(state, _mirror_chan, _mirror_thread)
                 for _part in render_for_slack(_mirror_body):
-                    await state.slack_client.post_message(_mirror_chan, _part, _mirror_thread)
+                    await state.slack_client.post_message(_mirror_chan, _part, _reply_post_ts)
                 if _mirror_options:
                     # Keep the ts this posts: the control has to be spendable
                     # later, and discarding the ts is what leaves a superseded
@@ -18996,7 +19017,7 @@ async def _run_chat(
                         _mirror_chan,
                         _mirror_blocks,
                         "Options",
-                        _mirror_thread,
+                        _reply_post_ts,
                     )
                     if _mirror_ts:
                         _owner = (

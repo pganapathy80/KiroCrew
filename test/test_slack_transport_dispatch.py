@@ -2213,3 +2213,22 @@ class TestFlatDmTransportWiring:
             text=f"{token} do it",
         )
         assert (canonical_key(thread_ts), thread_ts, "D0AP0870FFH") in sessions.links
+
+
+class TestCodeChannelPostThreadTs:
+    """The renderer's posting thread_ts (Slack code-channels top-level rule).
+
+    A code channel is one continuous top-level session: replies/streams post
+    top-level (thread_ts omitted) and setStatus carries no thread_ts (Slack
+    rejects it there). A user-started thread is still honoured, and non-code
+    channels thread under reply_ts exactly as before.
+    """
+
+    def test_code_channel_top_level_post_omits_thread(self):
+        assert transport_dispatch._code_channel_post_ts(True, None, "1717.1") is None
+
+    def test_code_channel_honours_a_user_thread(self):
+        assert transport_dispatch._code_channel_post_ts(True, "1700.0", "1700.0") == "1700.0"
+
+    def test_normal_channel_still_threads(self):
+        assert transport_dispatch._code_channel_post_ts(False, None, "1717.1") == "1717.1"

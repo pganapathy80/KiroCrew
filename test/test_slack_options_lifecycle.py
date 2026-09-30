@@ -1542,7 +1542,7 @@ class TestControlPostedAfterTheWindowIsSpent:
         from kiro_crew.slack import handler, transport_dispatch
 
         dispatch = inspect.getsource(transport_dispatch.handle_message_transport)
-        owner_expr = "get_session_for_thread(reply_ts) or session_key"
+        owner_expr = "get_session_for_thread(session_ts) or session_key"
         d_owner = dispatch.find("_options_owner =")
         assert d_owner != -1, "transport_dispatch must resolve the owner into a variable"
         assert owner_expr in dispatch[d_owner : d_owner + 200], (

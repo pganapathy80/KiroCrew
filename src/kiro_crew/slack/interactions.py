@@ -55,6 +55,7 @@ from kiro_crew.slack.allowlist import (
     persist_allowed_user,
     persist_tracking_channel,
 )
+from kiro_crew.slack.code_channel_store import clear_channel_state, forget_channel
 from kiro_crew.slack.format import (
     LINK_DASHBOARD_ACTION,
     OPTIONS_ACTION_PREFIX,
@@ -71,6 +72,7 @@ from kiro_crew.slack.handler import (
     handle_message,
     is_allowed_user,
     is_owner,
+    is_tracked_code_channel,
     set_allowed_users,
     set_tracking_channels,
 )
@@ -806,6 +808,11 @@ async def dispatch(payload: dict) -> None:
         await _handle_stop_kill_now(payload, action, channel, msg_ts, user_id)
         return
 
+    # ── Code channel: "Archive with summary" (kickoff button) ──
+    if action_id == "code_channel_archive":
+        await _handle_code_channel_archive(action, channel, user_id)
+        return
+
     # ── Dashboard copy link ──
     if action_id == "mc_dashboard_copy":
         url = action.get("value", "")
@@ -1421,6 +1428,21 @@ def _extract_selected_value(action: dict) -> tuple[str, str]:
 _ACTION_PAYLOAD_CAP = 4000
 
 
+def _action_reply_thread_ts(channel: str, msg_ts: str, user_thread_ts: str) -> str:
+    """The thread_ts an action (button / OPTIONS) response is anchored under.
+
+    In a code channel the whole channel is one session and Slack expects replies
+    in the channel, not in a thread, so an action response is posted top-level
+    (empty) unless the user GENUINELY threaded first. Everywhere else it falls back
+    to ``msg_ts`` so the action turn stays anchored under the message it acted on. Mirrors
+    ``transport_dispatch._code_channel_post_ts`` for the inbound path.
+    """
+    if user_thread_ts:
+        return user_thread_ts
+    is_code_channel = bool(_orch) and is_tracked_code_channel(_orch, channel)
+    return "" if is_code_channel else msg_ts
+
+
 async def _route_action_to_session(
     channel: str,
     msg_ts: str,
@@ -1643,7 +1665,9 @@ async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> No
     if not (_orch and _orch.slack):
         return
 
-    thread_ts = payload.get("message", {}).get("thread_ts") or msg_ts
+    thread_ts = _action_reply_thread_ts(
+        channel, msg_ts, payload.get("message", {}).get("thread_ts") or ""
+    )
     user_id = payload.get("user", {}).get("id", "")
     team_id = (payload.get("team") or {}).get("id", "")
 
@@ -1912,7 +1936,9 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
     if not ((choice or action_id.startswith(_ACTION_PREFIX)) and channel and _orch and _orch.slack):
         return
 
-    thread_ts = payload.get("message", {}).get("thread_ts") or msg_ts
+    thread_ts = _action_reply_thread_ts(
+        channel, msg_ts, payload.get("message", {}).get("thread_ts") or ""
+    )
     user_id = payload.get("user", {}).get("id", "")
     team_id = (payload.get("team") or {}).get("id", "")
     blocks = payload.get("message", {}).get("blocks", [])
@@ -2579,6 +2605,70 @@ async def _handle_stop_cancel(payload: dict, channel: str, msg_ts: str) -> None:
             await _orch.slack.delete_message(channel, msg_ts)
         except Exception:
             pass
+
+
+async def _handle_code_channel_archive(action: dict, channel: str, user_id: str) -> None:
+    """Archive a code channel from the kickoff "Archive with summary" button.
+
+    Runs the same path as ``/kirocrew archive`` (Slack ``agents.conversations.archive``
+    with a recorded ``summary_message_ts``):
+    post a summary message, archive the channel, and stop tracking it. The button's
+    ``value`` carries the channel id so the correct channel is archived even if the
+    click arrives from a stale copy; it falls back to the payload channel. Caller
+    authorization is already enforced by the allowlist gate in :func:`dispatch`.
+    The summary is the one a bare ``/kirocrew archive`` uses
+    (``code_channel_archive_summary``). With ``slack.code_channels`` off the button
+    is inert: it makes no Slack call and is audited as denied.
+    """
+    if not (_orch and _orch.slack):
+        return
+    target = str(action.get("value") or "").strip() or channel
+    if not target:
+        return
+    from kiro_crew.slack.handler import slack_cfg
+
+    if not slack_cfg(_orch).slack.code_channels:
+        sel().log_tool_invocation(
+            session_key="",
+            agent="kirocrew",
+            source="slack",
+            tool_name="code_channel_archive",
+            tool_kind="interaction",
+            outcome="denied",
+            resources=target,
+            metadata={"user_id": user_id, "reason": "code_channels_off"},
+        )
+        return
+    sel().log_tool_invocation(
+        session_key="",
+        agent="kirocrew",
+        source="slack",
+        tool_name="code_channel_archive",
+        tool_kind="interaction",
+        outcome="allowed",
+        resources=target,
+        metadata={"user_id": user_id},
+    )
+    # circular import: slack.events imports this module's dispatch at load time.
+    from kiro_crew.slack.events import _post_summary_to_origin, code_channel_archive_summary
+
+    try:
+        # Only a code channel is archived: checked before the summary is posted,
+        # so a button value naming an ordinary channel leaves no stray post.
+        if await _orch.slack.is_code_channel(target) is not True:
+            return
+        summary = await code_channel_archive_summary(_orch, target)
+        ts = await _orch.slack.post_message(target, f":white_check_mark: *Summary:* {summary}")
+        ok = await _orch.slack.archive_code_channel(target, summary_message_ts=ts)
+    except Exception:
+        logger.debug("code_channel_archive button failed", exc_info=True)
+        return
+    if ok:
+        clear_channel_state(_orch, target)
+        await asyncio.to_thread(forget_channel, target)
+        # Thread the closing summary back to the main conversation the channel came
+        # from (same as the /kirocrew archive path). Best-effort, shared helper.
+        await _post_summary_to_origin(_orch, target, summary)
 
 
 async def _handle_stop_kill_now(

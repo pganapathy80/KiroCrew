@@ -1527,6 +1527,22 @@ def slack_cfg(orch: object | None = None) -> KiroCrewConfig:
     return live.snapshot() or KiroCrewConfig.load()
 
 
+def is_tracked_code_channel(orch: object | None, channel: str) -> bool:
+    """True when *channel* is a code channel this gateway tracks AND
+    ``slack.code_channels`` is on.
+
+    Every code-channel behaviour keys on this rather than on membership of
+    ``orch._code_channels`` alone. That set is refilled from disk at startup
+    whatever the flag says, so a record kept from when the flag was on would
+    otherwise keep top-level posting, the session anchor, the turn context and
+    the chrome running with the feature off. The flag is read live, so turning it
+    back on picks the restored record up with nothing lost.
+    """
+    if not channel or channel not in getattr(orch, "_code_channels", ()):
+        return False
+    return bool(slack_cfg(orch).slack.code_channels)
+
+
 #: The Slack-owned attributes of :class:`KiroCrewConfig` that a reload copies
 #: onto the shared config object. Sections are replaced whole (the dataclass
 #: instance from the new load), so a read of ``slack_cfg().slack.<field>`` sees
@@ -3071,6 +3087,15 @@ async def maybe_route_linked_thread(
     append_and_surface(
         _dashboard_state, _linked_slot, "user", _safe_text, "msg msg-u", broadcast_user=True  # type: ignore[arg-type]
     )
+    # In a code channel the agent gets the same working context as an inbound
+    # message would (repo, instructions); the display row above stays the user's
+    # own text. Outside a code channel the hook answers "" and nothing changes.
+    _turn_text = text
+    _cc_context = getattr(_dashboard_state, "_code_channel_turn_context", None)
+    if callable(_cc_context):
+        _prefix = _cc_context(channel)
+        if isinstance(_prefix, str) and _prefix:
+            _turn_text = _prefix + text
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -3078,7 +3103,7 @@ async def maybe_route_linked_thread(
             _run_chat(
                 _dashboard_state,  # type: ignore[arg-type]
                 _linked_slot,
-                text,
+                _turn_text,
                 _directive_user_origin=True,
                 _directive_channel_origin=True,
             )
@@ -3094,7 +3119,7 @@ async def maybe_route_linked_thread(
         # linked=True here, so its own channel's queued messages keep draining;
         # only a constraint that appears AFTER this enqueue drops the entry.
         _linked_slot.queue_append(
-            text,
+            _turn_text,
             meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
             directive_user_origin=True,
             directive_channel_origin=True,

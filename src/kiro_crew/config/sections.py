@@ -1978,6 +1978,55 @@ class SlackConfig:
             tags=["slack"],
         ),
     )
+    code_channels: bool = field(
+        default=False,
+        metadata=_meta(
+            "Code Channels",
+            "Enable Slack code channels (agents.conversations.*): dedicated per-task "
+            "channels with a context bar and diff/view tabs. Slack partner beta — the "
+            "workspace must be feature-flagged by Slack for the code-channels pilot and "
+            "the app reinstalled with the code_channels:manage scope, or the API returns "
+            "feature_disabled / missing_scope. Default off; safe to leave off.",
+            tags=["slack"],
+        ),
+    )
+    code_channel_invitees: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Code Channel Invitees",
+            "Slack user/bot IDs to auto-invite when the agent creates a code channel "
+            "(e.g. a collaborating agent's bot). The human who triggered the "
+            "investigation is invited automatically; list additional collaborators here. "
+            "Requires code_channels enabled.",
+            tags=["slack"],
+        ),
+    )
+    code_channel_repo: str = field(
+        default="",
+        metadata=_meta(
+            "Code Channel Repo",
+            "Absolute path to a git repo whose context bar (repo/branch) and diff view "
+            "tab the gateway auto-posts in a code channel it created — at creation and "
+            "again when the agent finishes a turn there. Empty (default) disables this "
+            "chrome entirely (no-op). Requires code_channels enabled.",
+            tags=["slack"],
+        ),
+    )
+    code_channel_context_items: list[dict] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Code Channel Context Bar Items",
+            "Extra context-bar items to pin at the top of a code channel the gateway "
+            "created, appended after the auto-derived repo/branch items. Each item is "
+            "an object with a stable 'key', a 'label', an 'icon' (one of: folder, "
+            "branch, hierarchy, life-ring, link, globe, terminal, code, search, lock), "
+            "and an optional 'url' to make it a clickable link (e.g. a live app URL, a "
+            "PR link, a CI/status item). Slack's context bar holds at most 5 items "
+            "total, so items beyond the cap (after repo/branch) are dropped. Requires "
+            "code_channels enabled.",
+            tags=["slack"],
+        ),
+    )
     sessions_limit: int = field(
         default=10,
         metadata=_meta(

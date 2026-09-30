@@ -22,6 +22,7 @@ to pay for, so the whole subsystem is inert until `session_summary.enabled`.
 | Turn-end generation, the prompt | `dashboard/chat_summary.py` |
 | Sidecar cache | `history.py` (`ConversationLog`) |
 | Read endpoint | `dashboard/chat_handlers.py` (`api_chat_slot_summary`) |
+| Read-only reuse: a Slack code channel's archive summary | `slack/events.py` (`code_channel_archive_summary`) |
 
 ## Storage: a sidecar, never the transcript
 

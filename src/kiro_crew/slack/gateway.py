@@ -343,6 +343,7 @@ from kiro_crew.session import (
 )
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.client import RealSlackClient
+from kiro_crew.slack.code_channel_store import restore_into
 from kiro_crew.slack.format import (
     build_cron_ack_block,
     build_options_blocks,
@@ -356,6 +357,7 @@ from kiro_crew.slack.handler import (
     is_thread_incognito,
     is_thread_temporary,
     is_tracked_channel,
+    is_tracked_code_channel,
 )
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.retry import open_dm_with_retry
@@ -2117,6 +2119,47 @@ class GatewayOrchestrator:
         self._handler_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         self._session_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._pending_queue: dict[str, list] = {}
+        # Code channels this gateway knows: ones it created and ones it detected on
+        # an inbound message. Turns there get the working context, and the turn-end
+        # hook refreshes their context bar and diff view tab.
+        self._code_channels: set[str] = set()
+        # Code channel -> its originating (channel_id, message_ts) in the main
+        # conversation, so the result can be posted BACK to the message that
+        # triggered it: Slack does not share a code channel's archive summary to
+        # its origin. Persisted in the code-channel record, so a restart keeps it.
+        self._code_channel_origin: dict[str, tuple[str, str]] = {}
+        # Code channel -> the originating thread's text (e.g. another agent's
+        # root-cause write-up in the main channel), captured at creation and injected
+        # ONCE into the code channel's first turn so the agent starts with the full
+        # investigation, not just the one-line trigger Slack quotes. Popped on first
+        # use. In-memory and best-effort: a gateway restart before the first turn
+        # drops it, and the agent falls back to the trigger text alone.
+        self._code_channel_handoff: dict[str, str] = {}
+        # Code channel -> the repo it works in, bound per channel at creation rather
+        # than read from a global, so two channels opened for two repos each carry
+        # their own. slack.code_channel_repo is only the fallback for a single-repo
+        # setup.
+        self._code_channel_repo_by_id: dict[str, str] = {}
+        # Code channel -> a `git stash create` SHA snapshot of the working tree taken
+        # when the channel opened. The diff-view tab is computed against THIS baseline
+        # (not a bare `git diff`), so it shows only what the agent changed for this
+        # task, never pre-existing uncommitted litter in the repo. "" = clean at open.
+        self._code_channel_diff_base: dict[str, str] = {}
+        # Code channel -> the ts its Kiro Crew session is keyed on. A code channel is
+        # one continuous session, but each top-level message there has its own ts;
+        # keying on that ts would start a fresh session (no memory of the turns
+        # before) for every message. The first top-level message fixes the anchor.
+        self._code_channel_session_ts: dict[str, str] = {}
+        # Code channels this Kiro Crew is in charge of: ones it created, and ones
+        # Slack assigns to it alone. Only these are always-on; in a code channel
+        # another agent owns, it answers when addressed, like any channel.
+        self._owned_code_channels: set[str] = set()
+        # Refill the per-channel records above from disk, so a restart does not
+        # strand an existing code channel without its repo, baseline or origin.
+        try:
+            restore_into(self)
+        except Exception:
+            logger.warning("Failed to restore code channel records", exc_info=True)
         self._socket_client: WSSocketModeClient | None = None
         self._wecom_client: "WeComClient | None" = None  # set by maybe_start_wecom
         # Registry-owned live channel handles ({channel_type: client}). The
@@ -11518,8 +11561,49 @@ class GatewayOrchestrator:
                 self._dashboard_port = addresses[0][1]
         if self.slack and self.dashboard_state:
             self.dashboard_state.slack_client = self.slack
+            self._wire_code_channel_callbacks()
         if self.dashboard_state:
             self.dashboard_state.no_crons = self._no_crons  # dashboard mode
+
+    def _wire_code_channel_callbacks(self) -> None:
+        """Hand the dashboard state the gateway's code-channel hooks.
+
+        Called from both the full dashboard and the API-only server once
+        ``dashboard_state`` exists (it does not at boot). The dashboard mirror and
+        linked-slot routing read them.
+        """
+        state = self.dashboard_state
+        if state is None:
+            return
+        state._is_code_channel = functools.partial(is_tracked_code_channel, self)
+        state._code_channel_turn_context = self.code_channel_turn_context
+
+    def code_channel_turn_context(self, channel: str) -> str:
+        """The code-channel working context for a turn in *channel* ("" elsewhere).
+
+        Exposed to the dashboard so a button or OPTIONS answer routed to the linked
+        session gets the same context as an inbound message."""
+        # circular import: slack.events imports this module's orchestrator types.
+        from kiro_crew.slack.events import code_channel_turn_preamble
+
+        return code_channel_turn_preamble(self, channel)
+
+    def code_channel_session_ts(self, channel: str, msg_ts: str) -> tuple[str, bool]:
+        """The ts a message in *channel* keys its session on.
+
+        *msg_ts* is the message's own session ts (its thread, else itself). For a
+        known code channel the answer is the channel's session anchor (set by the
+        first message there), so every message, threaded or not, continues the
+        one session; returns ``(anchor, True)`` when this call set the anchor, so
+        the caller can persist it. Any other channel answers ``(msg_ts, False)``.
+        """
+        if not is_tracked_code_channel(self, channel):
+            return msg_ts, False
+        existing = self._code_channel_session_ts.get(channel)
+        if existing:
+            return existing, False
+        self._code_channel_session_ts[channel] = msg_ts
+        return msg_ts, True
 
     async def _init_api_server(self) -> None:
         """Start a minimal API-only HTTP server for MCP tool transport."""
@@ -11556,6 +11640,10 @@ class GatewayOrchestrator:
             addresses = self._dashboard_runner.addresses
             if addresses:
                 self._dashboard_port = addresses[0][1]
+        if self.slack and self.dashboard_state:
+            # The API-only (--slack-only) server needs the same code-channel hooks
+            # as the full dashboard.
+            self._wire_code_channel_callbacks()
         if self.dashboard_state:
             self.dashboard_state.no_crons = self._no_crons  # API-only mode
 

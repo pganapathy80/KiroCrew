@@ -23,7 +23,8 @@ features:
   # top-bar quick access and split view, and enables the agent-session lifecycle
   # (status, title, stop button) the gateway drives via agents.sessions.*.
   # Enabling it is what makes assistant:write valid. agent_view supersedes the
-  # deprecated assistant_view.
+  # deprecated assistant_view. Code channels are opt-in and NOT declared here:
+  # see "Code Channels" in docs/guides/slack-setup.md for the lines to add.
   agent_view:
     agent_description: Your personal AI agent. Chat, run multi-step tasks unattended, schedule jobs, and keep memory across sessions.
   bot_user:

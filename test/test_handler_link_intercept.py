@@ -549,3 +549,76 @@ class TestSessionsKeywordFallThrough:
             slot.append.assert_not_called()
         finally:
             handler.sel = orig_sel
+
+
+class TestLinkedRouteCodeChannelContext:
+    """A Slack answer routed into the linked session in a code channel gets the same
+    working context an inbound message would; the displayed row stays the user's."""
+
+    def _ds(self, slot, context):
+        ds = MagicMock()
+        ds.get_linked_slot = MagicMock(return_value=slot)
+        ds._background_tasks = set()
+        ds._code_channel_turn_context = context
+        return ds
+
+    def _slot(self, running=False):
+        slot = MagicMock()
+        type(slot).running = PropertyMock(return_value=running)
+        slot.key = "slot1"
+        return slot
+
+    @pytest.mark.asyncio
+    async def test_code_channel_answer_is_prefixed_for_the_agent(self):
+        from kiro_crew.slack import handler
+
+        slot = self._slot()
+        ds = self._ds(slot, lambda ch: "[Code channel working context]\n" if ch == "C_CC" else "")
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch.object(handler, "append_and_surface") as surface,
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as run_chat,
+        ):
+            routed = await handler.maybe_route_linked_thread(
+                "Deploy the fix now", "slack:1", "U1", "C_CC", _make_slack(), "1700.1"
+            )
+        assert routed is True
+        assert run_chat.call_args[0][2] == "[Code channel working context]\nDeploy the fix now"
+        assert surface.call_args[0][3] == "Deploy the fix now"
+
+    @pytest.mark.asyncio
+    async def test_queued_answer_is_prefixed_too(self):
+        from kiro_crew.slack import handler
+
+        slot = self._slot(running=True)
+        queued = []
+        slot.queue_append = lambda content, **kw: queued.append(content)
+        ds = self._ds(slot, lambda ch: "[ctx]\n")
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch.object(handler, "append_and_surface"),
+            patch("kiro_crew.dashboard.session_control.containment_meta", return_value={}),
+        ):
+            await handler.maybe_route_linked_thread(
+                "Deploy", "slack:1", "U1", "C_CC", _make_slack(), "1700.1"
+            )
+        assert queued == ["[ctx]\nDeploy"]
+
+    @pytest.mark.asyncio
+    async def test_other_channel_is_unchanged(self):
+        from kiro_crew.slack import handler
+
+        slot = self._slot()
+        ds = self._ds(slot, lambda ch: "")
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch.object(handler, "append_and_surface"),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as run_chat,
+        ):
+            await handler.maybe_route_linked_thread(
+                "hello", "slack:1", "U1", "C_MAIN", _make_slack(), "1700.1"
+            )
+        assert run_chat.call_args[0][2] == "hello"

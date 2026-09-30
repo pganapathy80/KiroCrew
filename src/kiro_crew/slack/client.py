@@ -7,6 +7,7 @@ Uses an ABC so tests can swap in a mock without touching Slack.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import urllib.parse
 from abc import ABC, abstractmethod
@@ -54,6 +55,10 @@ SESSION_STATUSES = frozenset(
         SESSION_STATUS_CLOSED,
     }
 )
+
+# Code channel context bar allows at most this many items (Slack caps at 5 and
+# silently drops the rest with a ``too_many_context_bar_items`` warning).
+_CONTEXT_BAR_MAX_ITEMS = 5
 
 
 #: Block Kit fields and block types that make SLACK'S OWN SERVERS fetch remote
@@ -268,6 +273,67 @@ class SlackClientOps(ABC):
     async def set_thread_title(self, channel: str, thread_ts: str, title: str) -> None:
         """Set the agent session's title (delegates to agents.sessions.rename)."""
 
+    # ── Code channels (agents.conversations.*) — Slack partner beta ──
+    # Reachable only when the workspace is flagged for the code-channels pilot
+    # and the bot holds ``code_channels:manage``. Gated at the call site by the
+    # default-off ``slack.code_channels`` config flag; these are no-op defaults
+    # so nothing here runs (or fails) for an install without the pilot.
+
+    async def create_code_channel(
+        self,
+        name: str,
+        *,
+        session_id: str | None = None,
+        origin_channel_id: str | None = None,
+        origin_message_ts: str | None = None,
+        is_private: bool | None = None,
+        team_id: str | None = None,
+    ) -> str | None:
+        """Create a code channel via agents.conversations.create. Returns its id."""
+        return None
+
+    async def archive_code_channel(
+        self, channel_id: str, summary_message_ts: str | None = None
+    ) -> bool:
+        """Archive a code channel via agents.conversations.archive."""
+        return False
+
+    async def set_code_channel_properties(
+        self, channel_id: str, context_bar_items: list[dict[str, Any]]
+    ) -> bool:
+        """Set a code channel's context bar via agents.conversations.setProperties."""
+        return False
+
+    async def set_code_channel_view(
+        self,
+        channel_id: str,
+        *,
+        view_type: str = "diff",
+        content: str | None = None,
+        view_key: str | None = None,
+        name: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        base_branch: str | None = None,
+        head_branch: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Create/update a code channel view via agents.conversations.setView."""
+        return None
+
+    async def code_channel_agent_ids(self, channel_id: str) -> list[str] | None:
+        """Bot user ids of the agents Slack assigns to a code channel (None = unknown)."""
+        return None
+
+    async def is_code_channel(self, channel_id: str) -> bool | None:
+        """True when a channel is a code channel (record_type == agent_channel).
+
+        None means the lookup failed (unknown), as distinct from False.
+        """
+        return False
+
+    async def invite_users(self, channel_id: str, user_ids: list[str]) -> dict[str, Any]:
+        """Invite users/bots to a channel (conversations.invite). No-op default."""
+        return {"ok": True, "invited": [], "error": None}
+
     async def fetch_message(self, channel: str, ts: str) -> str | None:
         """Fetch a single message's text by channel and timestamp.
 
@@ -322,6 +388,28 @@ class SlackClientOps(ABC):
         raise NotImplementedError
 
 
+def _slack_error_code(exc: Exception) -> str:
+    """Best-effort extraction of Slack's ``error`` string from an API exception.
+
+    ``SlackApiError`` carries the parsed response on ``.response``; other errors
+    (transport, JSON) carry nothing useful. Returns "" when no code is present.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return ""
+    try:
+        code = resp["error"]
+    except (KeyError, TypeError, IndexError):
+        code = getattr(resp, "get", lambda _k: None)("error")
+    return str(code) if code else ""
+
+
+#: Per-task store behind RealSlackClient._last_code_channel_error.
+_LAST_CODE_CHANNEL_ERROR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "slack_last_code_channel_error", default=""
+)
+
+
 class RealSlackClient(SlackClientOps):
     """Slack Web API client backed by slack_sdk."""
 
@@ -342,6 +430,22 @@ class RealSlackClient(SlackClientOps):
         # message for the rest of the run; a gateway restart clears the set
         # and lets resolution try again.
         self._channel_team_unresolvable: set[str] = set()
+
+    @property
+    def _last_code_channel_error(self) -> str:
+        """The Slack ``error`` code from this task's most recent failed
+        agents.conversations.* call (e.g. "feature_disabled", "missing_scope",
+        "invalid_origin_link"); empty after a success or when no code could be
+        extracted. Callers read it right after the call to map a documented code to
+        actionable text. Held per asyncio task (a ContextVar), so two code-channel
+        calls failing concurrently in different sessions each read their own code
+        rather than whichever failure landed last.
+        """
+        return _LAST_CODE_CHANNEL_ERROR.get()
+
+    @_last_code_channel_error.setter
+    def _last_code_channel_error(self, value: str) -> None:
+        _LAST_CODE_CHANNEL_ERROR.set(value)
 
     def record_channel_team(self, channel: str, team_id: str) -> None:
         """Cache the workspace team_id for a channel.  Idempotent.
@@ -683,9 +787,15 @@ class RealSlackClient(SlackClientOps):
             await self.ensure_channel_team(channel)
             body: dict[str, Any] = {
                 "channel": channel,
-                "thread_ts": thread_ts,
                 "task_display_mode": "plan",
             }
+            # A top-level stream (the dashboard mirror into a code channel passes
+            # thread_ts="") must OMIT the key: an empty string is neither the
+            # documented "omit" nor the accepted "0", so Slack rejects it and the
+            # stream silently demotes to the non-streaming surface. Only thread
+            # under a real ts.
+            if thread_ts:
+                body["thread_ts"] = thread_ts
             # Workspace routing for org-wide installs.  Prefer the cached
             # home team for this channel — that's the workspace the channel
             # lives in, which is what ``body["team_id"]`` must route to.
@@ -821,6 +931,221 @@ class RealSlackClient(SlackClientOps):
     async def set_thread_title(self, channel: str, thread_ts: str, title: str) -> None:
         """Set the thread's agent-session title (delegates to agents.sessions.rename)."""
         await self.rename_session(channel, thread_ts, title)
+
+    # ── Code channels (agents.conversations.*) — Slack partner beta ──
+
+    async def create_code_channel(
+        self,
+        name: str,
+        *,
+        session_id: str | None = None,
+        origin_channel_id: str | None = None,
+        origin_message_ts: str | None = None,
+        is_private: bool | None = None,
+        team_id: str | None = None,
+    ) -> str | None:
+        """Create a code channel; returns its channel id, or None on failure.
+
+        ``session_id`` is an idempotency key: retrying with the same value
+        returns the existing channel instead of creating a duplicate. Passing
+        the origin link makes Slack match the origin channel's privacy and
+        invite the origin author.
+        """
+        body: dict[str, Any] = {"name": name}
+        if session_id:
+            body["session_id"] = session_id
+        if origin_channel_id and origin_message_ts:
+            body["origin_channel_id"] = origin_channel_id
+            body["origin_message_ts"] = origin_message_ts
+        if is_private is not None:
+            body["is_private"] = is_private
+        if team_id:
+            body["team_id"] = team_id
+        try:
+            resp = await self._web.api_call("agents.conversations.create", json=body)
+            cid = resp.get("channel_id")
+            self._last_code_channel_error = ""
+            return str(cid) if cid else None
+        except Exception as exc:
+            self._last_code_channel_error = _slack_error_code(exc)
+            logger.warning(
+                "agents.conversations.create failed (error=%s)",
+                self._last_code_channel_error or "unknown",
+                exc_info=True,
+            )
+            return None
+
+    async def archive_code_channel(
+        self, channel_id: str, summary_message_ts: str | None = None
+    ) -> bool:
+        """Archive a code channel, optionally recording a summary message."""
+        body: dict[str, Any] = {"channel_id": channel_id}
+        if summary_message_ts:
+            body["summary_message_ts"] = summary_message_ts
+        try:
+            await self._web.api_call("agents.conversations.archive", json=body)
+            self._last_code_channel_error = ""
+            return True
+        except Exception as exc:
+            self._last_code_channel_error = _slack_error_code(exc)
+            logger.warning(
+                "agents.conversations.archive failed (error=%s)",
+                self._last_code_channel_error or "unknown",
+                exc_info=True,
+            )
+            return False
+
+    async def set_code_channel_properties(
+        self, channel_id: str, context_bar_items: list[dict[str, Any]]
+    ) -> bool:
+        """Replace a code channel's context bar (repo/branch/PR/CI orientation).
+
+        The array is a full replacement, capped at 5 items; Slack keeps only the
+        first 5 and warns on the rest, so we trim here to stay explicit.
+        """
+        items = context_bar_items[:_CONTEXT_BAR_MAX_ITEMS]
+        body: dict[str, Any] = {
+            "channel_id": channel_id,
+            "code_channel": {"context_bar_items": items},
+        }
+        try:
+            await self._web.api_call("agents.conversations.setProperties", json=body)
+            self._last_code_channel_error = ""
+            return True
+        except Exception as exc:
+            self._last_code_channel_error = _slack_error_code(exc)
+            logger.warning(
+                "agents.conversations.setProperties failed (error=%s)",
+                self._last_code_channel_error or "unknown",
+                exc_info=True,
+            )
+            return False
+
+    async def set_code_channel_view(
+        self,
+        channel_id: str,
+        *,
+        view_type: str = "diff",
+        content: str | None = None,
+        view_key: str | None = None,
+        name: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        base_branch: str | None = None,
+        head_branch: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Create or update a view tab on a code channel (agents.conversations.setView).
+
+        ``setView`` is an upsert keyed by ``view_key`` (ignored for ``diff``,
+        which is a per-channel singleton). ``view_type`` selects what the tab
+        renders: ``html`` (self-contained HTML), ``diff`` (unified diff) or
+        ``block_kit`` (Block Kit ``blocks``).
+        Returns the view's identity fields (``view_id``, ``content_version``,
+        ``file_id``, ``type``) or None on failure (the Slack error is recorded on
+        ``_last_code_channel_error``).
+        """
+        body: dict[str, Any] = {"channel_id": channel_id, "type": view_type}
+        if content is not None:
+            body["content"] = content
+        if view_key is not None:
+            body["view_key"] = view_key
+        if name is not None:
+            body["name"] = name
+        if blocks is not None:
+            body["blocks"] = blocks
+        if base_branch is not None:
+            body["base_branch"] = base_branch
+        if head_branch is not None:
+            body["head_branch"] = head_branch
+        try:
+            resp = await self._web.api_call("agents.conversations.setView", json=body)
+            self._last_code_channel_error = ""
+            return {
+                key: resp.get(key)
+                for key in ("view_id", "content_version", "file_id", "type")
+                if resp.get(key) is not None
+            }
+        except Exception as exc:
+            self._last_code_channel_error = _slack_error_code(exc)
+            logger.warning(
+                "agents.conversations.setView failed (error=%s)",
+                self._last_code_channel_error or "unknown",
+                exc_info=True,
+            )
+            return None
+
+    async def code_channel_agent_ids(self, channel_id: str) -> list[str] | None:
+        """Bot user ids of the agent(s) assigned to a code channel.
+
+        Read from ``properties.agent_session.encoded_agent_bot_user_ids``. None when
+        the lookup failed or the field is absent, so a caller can tell "unknown"
+        from "no agents".
+        """
+        try:
+            kwargs: dict[str, Any] = {"channel": channel_id}
+            self._inject_team(channel_id, kwargs)
+            resp = await self._web.conversations_info(**kwargs)
+            props = (resp.get("channel") or {}).get("properties") or {}
+            ids = (props.get("agent_session") or {}).get("encoded_agent_bot_user_ids")
+            if not isinstance(ids, list):
+                return None
+            return [str(x) for x in ids if x]
+        except Exception:
+            logger.debug("conversations.info (code_channel_agent_ids) failed", exc_info=True)
+            return None
+
+    async def is_code_channel(self, channel_id: str) -> bool | None:
+        """True when the channel's record_type is agent_channel.
+
+        This is the reliable signal (per Slack): the ``record_channel`` block is
+        written at creation and appears on nothing else. Do not gate on
+        ``code_channel`` being populated — it is ``{}`` on a fresh channel.
+        None when the lookup failed, so a caller can tell "not a code channel"
+        from "could not ask" and retry only the latter.
+        """
+        try:
+            kwargs: dict[str, Any] = {"channel": channel_id}
+            self._inject_team(channel_id, kwargs)
+            resp = await self._web.conversations_info(**kwargs)
+            props = (resp.get("channel") or {}).get("properties") or {}
+            record = props.get("record_channel") or {}
+            return record.get("record_type") == "agent_channel"
+        except Exception:
+            logger.debug("conversations.info (is_code_channel) failed", exc_info=True)
+            return None
+
+    async def invite_users(self, channel_id: str, user_ids: list[str]) -> dict[str, Any]:
+        """Invite users/bots to a channel via conversations.invite.
+
+        Pulls collaborators (the human owner, other agent bots) into a code
+        channel the agent just created. Returns ``{"ok": bool, "invited":
+        [...], "error": str|None}``; already-present members are treated as a
+        success, not an error.
+        """
+        ids = [u for u in user_ids if u]
+        if not ids:
+            return {"ok": True, "invited": [], "error": None}
+        body: dict[str, Any] = {"channel": channel_id, "users": ",".join(ids)}
+        self._inject_team(channel_id, body)
+        try:
+            await self._web.api_call("conversations.invite", json=body)
+            return {"ok": True, "invited": ids, "error": None}
+        except SlackClientError as exc:
+            err = ""
+            resp = getattr(exc, "response", None)
+            if resp is not None:
+                try:
+                    err = str(resp.get("error", "") or "")
+                except Exception:
+                    err = ""
+            # already_in_channel / cant_invite_self are benign — the goal
+            # (that member is present) is already met.
+            if err in ("already_in_channel", "cant_invite_self"):
+                return {"ok": True, "invited": ids, "error": None}
+            logger.warning("conversations.invite failed: %s", err or exc)
+            return {"ok": False, "invited": [], "error": err or str(exc)}
+        except Exception as exc:
+            logger.warning("conversations.invite failed", exc_info=True)
+            return {"ok": False, "invited": [], "error": str(exc)}
 
     @staticmethod
     def _extract_inline_texts(elements: list[dict[str, Any]]) -> list[str]:
