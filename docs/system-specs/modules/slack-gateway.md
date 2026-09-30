@@ -146,6 +146,23 @@ Slack Socket Mode → events.py (dispatch) → handler.py → SessionManager →
                   ↘ member_joined_channel → allowlist.py (prompt_allowlist) → owner DM
 ```
 
+### Identities & auth planes
+
+These are separate, and mixing them up leads to wrong fixes:
+
+- **In Slack, Kiro Crew is the Slack app's bot token** (`RealSlackClient(AsyncWebClient(token=bot_token))`).
+  The bot creates code channels, posts, streams and sets session status with the
+  manifest's OAuth scopes. This is not `kiro-cli`.
+- **Kiro Crew's reasoning is `kiro-cli`** (the KiroACP harness), which authenticates to
+  the model backend and never talks to Slack.
+- **The code-channel MCP tools carry no Slack credential.** `create_code_channel` posts
+  to a loopback `_STRICT_INTERNAL_API_PATHS` endpoint authenticated by the internal
+  secret and a strict, verified `X-Session-Key`; the gateway then calls Slack with the
+  bot token.
+- **MCP is control, not transport.** The MCP tools are the agent's control verbs. The
+  Slack messaging itself (streaming, status, posts) goes over the Slack Web API, and
+  inbound events arrive over Socket Mode. Neither is MCP.
+
 ## Files
 
 | File | Purpose |
@@ -483,6 +500,21 @@ escaped, so the clip never cuts an entity such as `&amp;` in half.
 The whole create-and-set-up sequence lives once in
 `events.create_code_channel_core(orch, name, caller_id)`.
 
+It has two callers: the slash command (which keeps its own `respond()` replies) and the
+**`create_code_channel` MCP tool** (kirocrew-core), so Kiro Crew can open a code channel
+mid-turn itself. The tool posts to the internal-secret-only
+`POST /api/create-code-channel` (`_STRICT_INTERNAL_API_PATHS`), which calls
+`GatewayOrchestrator.create_code_channel_for_task`. The MCP caller is a session rather
+than a Slack user, so an empty caller id falls back to the owner for the human invite,
+and the Slack message that started the caller's turn (`remember_session_origin`, keyed
+by the verified session) becomes the channel's origin link, which makes Slack invite
+that message's author and show them the private channel. The tool is held to the same
+bar as `send_message`: a strict session key (`require_strict_session_key`),
+channel-agent containment (`CHANNEL_AGENT_BLOCKED_TOOLS` plus the MCP-dispatch
+`_deny_channel_agent_messaging` guard) and the messaging and Slack governance checks. It
+returns `feature_disabled` or `missing_scope` cleanly when the pilot or the scope is
+missing.
+
 **Origin-thread handoff.** When the channel is created with an origin
 (`origin_channel_id` and `origin_message_ts`, the message that triggered it, for example
 another agent's root-cause write-up in the main channel), `create_code_channel_core`
@@ -570,6 +602,24 @@ the user's own thread).
   message (`code_channel_turn_preamble`, wired as
   `DashboardState._code_channel_turn_context`); the displayed row stays the user's own
   text.
+- **Result back to the origin:** a code channel may `send_message` to the channel it
+  was opened from even when that channel is not tracked, threaded on the origin message
+  unless the caller names a `thread_ts`. The binding is the origin the gateway recorded
+  at creation, looked up through the caller's verified session
+  (`code_channel_origin_for_session`, wired as
+  `DashboardState._code_channel_origin_for_session`) on the internal-secret transport
+  only; the MCP tool forwards a strictly resolved `caller_session` for a `channel=`
+  send, without refusing one it cannot identify. Any other untracked channel is still
+  refused with 403.
+- **Loop guard:** `create_code_channel_for_task` refuses (`already_in_code_channel`,
+  endpoint 409) when the caller's session already resolves to a known code channel
+  (`_resolve_session_code_channel`), so the `create_code_channel` MCP tool cannot open
+  a channel from inside one. Without it, an always-on channel that Slack seeds with a
+  quote of the triggering message means an instruction like "open a code channel and
+  fix it" fires the tool again on every turn and opens channels without bound. The MCP
+  tool returns the refusal as guidance to carry on in place, not as a failure. Only the
+  MCP path is guarded: the `/kirocrew codechannel` command does not go through
+  `create_code_channel_for_task` and stays unrestricted.
 - **Auto chrome:** when the channel has a repo (the per-channel repo bound at creation,
   else `slack.code_channel_repo`), `_post_code_channel_chrome` posts the context bar
   (repo and branch) at creation and the working-tree change as a diff view tab when a

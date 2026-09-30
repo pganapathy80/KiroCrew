@@ -292,6 +292,39 @@ class TestMirrorPostThreadInCodeChannel:
         assert _mirror_post_thread(MagicMock(), "C_CC", "1700.1") == "1700.1"
 
 
+class TestCodeChannelOriginForSession:
+    """The origin a session may post back to is the one its code channel recorded."""
+
+    def _gw(self, resolved_channel, origins):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            _resolve_session_code_channel=lambda key: resolved_channel,
+            _code_channel_origin=origins,
+        )
+
+    def test_returns_recorded_origin_of_the_sessions_code_channel(self):
+        from kiro_crew.slack.gateway import GatewayOrchestrator
+
+        gw = self._gw("C_CC", {"C_CC": ("C_MAIN", "1700.1")})
+        assert GatewayOrchestrator.code_channel_origin_for_session(gw, "slack:1") == (
+            "C_MAIN",
+            "1700.1",
+        )
+
+    def test_non_code_channel_session_has_no_origin(self):
+        from kiro_crew.slack.gateway import GatewayOrchestrator
+
+        gw = self._gw("", {"C_CC": ("C_MAIN", "1700.1")})
+        assert GatewayOrchestrator.code_channel_origin_for_session(gw, "slack:1") is None
+
+    def test_consumed_origin_is_gone(self):
+        from kiro_crew.slack.gateway import GatewayOrchestrator
+
+        gw = self._gw("C_CC", {})
+        assert GatewayOrchestrator.code_channel_origin_for_session(gw, "slack:1") is None
+
+
 class TestCodeChannelSurvivesRestart:
     """Creation persists the per-channel record; a fresh gateway restores it."""
 

@@ -2123,6 +2123,13 @@ class GatewayOrchestrator:
         # an inbound message. Turns there get the working context, and the turn-end
         # hook refreshes their context bar and diff view tab.
         self._code_channels: set[str] = set()
+        # Triggering Slack message per session: session_key -> (channel_id,
+        # message_ts). When the agent opens a code channel mid-turn (the
+        # create_code_channel MCP tool), the channel is created with THIS message
+        # as its origin link, so Slack auto-invites the human who triggered the
+        # task and opens the private channel in their sidebar. Keyed by session so
+        # a sub-agent or another session can never inherit an unrelated origin.
+        self._session_origin_msg: dict[str, tuple[str, str]] = {}
         # Code channel -> its originating (channel_id, message_ts) in the main
         # conversation, so the result can be posted BACK to the message that
         # triggered it: Slack does not share a code channel's archive summary to
@@ -11570,13 +11577,102 @@ class GatewayOrchestrator:
 
         Called from both the full dashboard and the API-only server once
         ``dashboard_state`` exists (it does not at boot). The dashboard mirror and
-        linked-slot routing read them.
+        linked-slot routing read the first two; each MCP tool endpoint reads its
+        own callback and answers ``slack_unavailable`` when it is unwired.
         """
         state = self.dashboard_state
         if state is None:
             return
         state._is_code_channel = functools.partial(is_tracked_code_channel, self)
         state._code_channel_turn_context = self.code_channel_turn_context
+        state._create_code_channel = self.create_code_channel_for_task
+        state._code_channel_origin_for_session = self.code_channel_origin_for_session
+
+    def remember_session_origin(self, session_key: str, channel_id: str, message_ts: str) -> None:
+        """Record the Slack message that started ``session_key``'s current turn.
+
+        Used so a code channel the agent opens mid-turn can be created with this
+        message as its origin link (Slack then invites the human author and opens
+        the private channel in their sidebar). No-op unless all three are truthy.
+        Bounded: a long-lived gateway sees many sessions, so cap the map and drop
+        the oldest insertion once it grows past the cap — the value is only needed
+        for the brief window between a message and the agent opening a channel."""
+        if not (session_key and channel_id and message_ts):
+            return
+        cap = 256
+        if len(self._session_origin_msg) >= cap and session_key not in self._session_origin_msg:
+            # Drop the oldest inserted key (dict preserves insertion order).
+            oldest = next(iter(self._session_origin_msg))
+            self._session_origin_msg.pop(oldest, None)
+        self._session_origin_msg[session_key] = (channel_id, message_ts)
+
+    async def create_code_channel_for_task(
+        self, name: str, caller_id: str, session_key: str = "", repo: str = ""
+    ) -> dict:
+        """Create a code channel programmatically (the create_code_channel MCP tool
+        path). Delegates to the single source of truth shared with the
+        ``/kirocrew codechannel`` slash command, so both routes create, invite,
+        set always-on, and post chrome identically.
+
+        The MCP caller is a session, not a Slack user, so it cannot name the human
+        to invite; fall back to the owner so the person who owns the workspace is
+        pulled into the channel the agent opened (mirrors the slash command, which
+        invites its human initiator).
+
+        ``session_key`` (the caller's verified session) resolves the triggering
+        Slack message recorded by :meth:`remember_session_origin`; when known it is
+        passed as the channel's origin link so Slack invites the human author and
+        opens the private channel in their sidebar. It is also Slack's idempotency
+        key, so a retry/restart reconnects to the same channel."""
+        from kiro_crew.slack.events import create_code_channel_core
+
+        # Loop guard: the agent-facing path must NOT open a code channel when its
+        # own session is already working in one. A code channel is always-on, and
+        # Slack seeds it with a quote of the triggering message (the origin link) --
+        # so an instruction like "open a code channel and fix it" fires a fresh turn
+        # inside the new channel, and without this guard the agent calls this tool
+        # again, spawning another channel every turn (unbounded fan-out). The agent
+        # should do the work in the channel it is already in; refuse rather than
+        # create. Only the MCP path is guarded -- the human /kirocrew codechannel
+        # command does not reach here and stays unrestricted.
+        existing = self._resolve_session_code_channel(session_key) if session_key else ""
+        if existing:
+            return {"ok": False, "channel_id": existing, "error": "already_in_code_channel"}
+
+        origin = self._session_origin_msg.get(session_key) if session_key else None
+        if origin:
+            return await create_code_channel_core(
+                self,
+                name,
+                caller_id or self._owner_id,
+                origin_channel_id=origin[0],
+                origin_message_ts=origin[1],
+                session_id=session_key or None,
+                repo=repo,
+            )
+        return await create_code_channel_core(
+            self, name, caller_id or self._owner_id, session_id=session_key or None, repo=repo
+        )
+
+    def _resolve_session_code_channel(self, session_key: str) -> str:
+        """Return the code channel a session is working in, or "" if it is not one.
+
+        Anything that acts on the code channel a session is in resolves it here,
+        from the session itself, never from a channel the agent names. The
+        session's Slack channel comes from its slack link (falling back to its
+        origin link) and is only accepted when it is a KNOWN code channel
+        (``_code_channels``, filled when Kiro Crew creates one and when it detects
+        one on an inbound message). Any other session resolves to "", so the caller
+        is refused rather than allowed to act on an ordinary channel."""
+        if not (session_key and self.sessions):
+            return ""
+        _ts, channel = self.sessions.get_slack_link(session_key)
+        if channel and channel in self._code_channels:
+            return channel
+        link = self.sessions.get_origin_link(session_key)
+        if link and link.channel_id and link.channel_id in self._code_channels:
+            return link.channel_id
+        return ""
 
     def code_channel_turn_context(self, channel: str) -> str:
         """The code-channel working context for a turn in *channel* ("" elsewhere).
@@ -11604,6 +11700,20 @@ class GatewayOrchestrator:
             return existing, False
         self._code_channel_session_ts[channel] = msg_ts
         return msg_ts, True
+
+    def code_channel_origin_for_session(self, session_key: str) -> tuple[str, str] | None:
+        """The (channel, message ts) a session's code channel was opened from.
+
+        Only the origin the gateway itself recorded when it created the code
+        channel counts, looked up through the channel the session is verifiably
+        in (``_resolve_session_code_channel``), never a channel the caller names.
+        None for a non-code-channel session, a code channel with no recorded
+        origin (slash-created), or one whose origin was already consumed on
+        archive."""
+        channel = self._resolve_session_code_channel(session_key)
+        if not channel:
+            return None
+        return self._code_channel_origin.get(channel)
 
     async def _init_api_server(self) -> None:
         """Start a minimal API-only HTTP server for MCP tool transport."""
@@ -11642,7 +11752,7 @@ class GatewayOrchestrator:
                 self._dashboard_port = addresses[0][1]
         if self.slack and self.dashboard_state:
             # The API-only (--slack-only) server needs the same code-channel hooks
-            # as the full dashboard.
+            # as the full dashboard: the MCP tools post to endpoints it serves.
             self._wire_code_channel_callbacks()
         if self.dashboard_state:
             self.dashboard_state.no_crons = self._no_crons  # API-only mode

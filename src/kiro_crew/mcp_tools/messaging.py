@@ -254,6 +254,42 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "create_code_channel",
+            "description": (
+                "Create a Slack code channel for a coding task and start working in "
+                "it. Use this when you decide a task warrants its own dedicated "
+                "channel (e.g. an investigation or fix the user asked you to drive "
+                "in Slack) so the work has a focused space with the human and any "
+                "configured collaborator agents "
+                "auto-invited. The channel is created private and always-on, a "
+                "kickoff message is posted, and the repo context bar is shown. "
+                "Requires the Slack gateway to be running with code channels enabled "
+                "(Slack code-channels pilot); returns an error otherwise. Pass a "
+                "short human-readable task name, and `repo` = the absolute path of "
+                "the repo you are working on for this task so the channel binds to it "
+                "(the repo/branch context bar and diff view come from there)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short human-readable task name for the code channel.",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path of the working repo for this task. The "
+                            "channel binds to it (repo/branch context bar, diff view, "
+                            "and the working-repo the agent edits). Omit only for a "
+                            "single-repo setup with a configured default."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+        {
             "name": "send_notification",
             "description": (
                 "Publish a notification to the Kiro Crew notification center "
@@ -548,6 +584,11 @@ def send_message(name: str, args: dict[str, Any]) -> str:
         )
         if not verified_session:
             return _strict_err
+    elif args.get("channel"):
+        # A plain channel= send keeps working unidentified (the gateway's tracked
+        # channel rule still applies), but a strictly-identified caller forwards
+        # its key so the gateway can honour that session's own code-channel origin.
+        verified_session, _ = mcp_core.require_strict_session_key("")
     # ``gov_session`` is the identity every gate below is keyed on. It is the
     # STRICT key whenever one was required, so the identity that is checked is
     # the identity the request is later sent under (``_post`` gets the same
@@ -679,6 +720,64 @@ def send_message(name: str, args: dict[str, Any]) -> str:
             "(owner DM unavailable: no Slack client or owner_id). Verify Slack delivery."
         )
     return "Notification delivered."
+
+
+def create_code_channel(name: str, args: dict[str, Any]) -> str:
+    channel_name = str(args.get("name", "") or "").strip()
+    if not channel_name:
+        return "Error: name is required."
+    # Creating a code channel is a Slack side effect (a new channel, invites,
+    # posts), so it is attributed to a STRICTLY-resolved caller. The lenient
+    # resolver walks process ancestors, and a sub-agent would otherwise create a
+    # channel as its parent's session. Refuse rather than guess; every surface
+    # that can legitimately call this carries an injected key or HMAC-verified pid.
+    verified_session, strict_err = mcp_core.require_strict_session_key(
+        "Error: cannot verify caller identity for create_code_channel "
+        "(no gateway-injected session key or HMAC-verified pid). "
+        "Refusing to create a Slack channel that cannot be attributed."
+    )
+    if not verified_session:
+        return strict_err
+    # Channel-agent containment: same boundary as send_message. An auto-approved
+    # kirocrew-core call emits no permission event, so channel.py's guard cannot
+    # hold it — the boundary is re-asserted here at MCP dispatch on the verified id.
+    chan_deny = mcp_core._deny_channel_agent_messaging(verified_session, "create_code_channel")
+    if chan_deny:
+        return chan_deny
+    # Governance: this egresses on Slack. Gate the messaging capability and the
+    # Slack transport, keyed on the identity the request is sent under.
+    gov_msg = mcp_core._vet_messaging_governance(verified_session)
+    if gov_msg:
+        return f"Error: {gov_msg}"
+    gov_chan = mcp_core._vet_channel_governance(verified_session, "slack")
+    if gov_chan:
+        return f"Error: {gov_chan}"
+    # Repo the agent is working on for this task, bound to the channel so the
+    # working-repo is generic per codebase (not a global). Optional: empty falls
+    # back to the single-repo default on the gateway.
+    repo = str(args.get("repo", "") or "").strip()
+    resp = mcp_core._post(
+        "/api/create-code-channel",
+        {"name": channel_name, "repo": repo},
+        session_key=verified_session,
+    )
+    if not resp.get("ok"):
+        if resp.get("code") == "already_in_code_channel":
+            # Not a failure: this session is already working in a code channel, so
+            # the gateway refused to open another (the loop guard). Steer the agent
+            # to continue in place. No "Error:" prefix, so it is not recorded as a
+            # tool failure or retried.
+            return (
+                "You're already in a code channel — continue the work here "
+                "(investigate, edit, test, post a diff view) rather than opening another."
+            )
+        # "Error:" prefix so call_tool_with_logging records it as a failure.
+        return f"Error: {resp.get('error') or resp}"
+    channel_id = resp.get("channel_id", "")
+    note = ""
+    if resp.get("invite_ok") is False:
+        note = f" (note: could not auto-invite everyone — {resp.get('invite_error')})"
+    return f"Code channel created: <#{channel_id}>{note}"
 
 
 def send_notification(name: str, args: dict[str, Any]) -> str:
@@ -1196,6 +1295,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
 
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "send_message": send_message,
+    "create_code_channel": create_code_channel,
     "send_notification": send_notification,
     "delete_message": delete_message,
     "update_message": update_message,

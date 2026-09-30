@@ -126,7 +126,10 @@ CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS: dict[str, tuple[tuple[str, str], ...]
 # containment this list exists to hold.  SEND is the sharpest of the four: stop
 # only cancels and read only exfiltrates, but send delivers text that the target
 # session RUNS as a turn — so external channel content would execute inside a
-# private dashboard conversation.
+# private dashboard conversation.  create_code_channel is blocked for the same
+# reason as session_create: it writes nothing into an existing conversation, but
+# it stands up a new Slack channel (and invites people into it) that the channel
+# agent then owns and acts in, a persistent thing outside its containment.
 # The dispatch verbs above are appended rather than respelled here, so the
 # interactive guard and the MCP-dispatch guard read ONE list.
 # Matched against the rendered
@@ -135,6 +138,7 @@ CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS: dict[str, tuple[tuple[str, str], ...]
 CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "send_message",
     "send_notification",
+    "create_code_channel",
     "session_stop",
     # Changing a session's model decides what the user's next turn there runs
     # on and spends; same containment reason as stop.

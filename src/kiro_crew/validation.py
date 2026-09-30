@@ -1668,6 +1668,18 @@ UPDATE_MESSAGE_SCHEMA = ToolSchema(
     ],
 )
 
+# create_code_channel takes a required channel name (the task) and an optional
+# repo — the working repo the agent binds to THIS channel so the feature is generic
+# per codebase (empty falls back to the single-repo default). Bounded to
+# MAX_SHORT_STRING; Slack itself further constrains the name server-side.
+CREATE_CODE_CHANNEL_SCHEMA = ToolSchema(
+    tool_name="create_code_channel",
+    fields=[
+        FieldSpec("name", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("repo", str, required=False, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SKILL_SEARCH_SCHEMA = ToolSchema(
     tool_name="skill_search",
     fields=[
@@ -3577,6 +3589,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "skill_fetch": SKILL_FETCH_SCHEMA,
     "task_run": TASK_RUN_SCHEMA,
     "send_message": SEND_MESSAGE_SCHEMA,
+    "create_code_channel": CREATE_CODE_CHANNEL_SCHEMA,
     "send_notification": SEND_NOTIFICATION_SCHEMA,
     "read_slack_profile": READ_SLACK_PROFILE_SCHEMA,
     "wait": WAIT_SCHEMA,

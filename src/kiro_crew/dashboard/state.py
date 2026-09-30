@@ -5653,6 +5653,12 @@ class DashboardState:
         # (channel_id) -> str: the working context a code-channel turn starts with,
         # prepended to a Slack answer routed into the linked session.
         self._code_channel_turn_context: Any = None
+        # async (name, caller_id, session_key, repo) -> dict; creates a code channel
+        # for the create_code_channel MCP tool (/api/create-code-channel).
+        self._create_code_channel: Any = None
+        # (session_key) -> (channel, ts) | None: the origin a session's code
+        # channel was opened from, so its result can be posted back there.
+        self._code_channel_origin_for_session: Any = None
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)

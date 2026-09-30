@@ -390,6 +390,16 @@ async def handle_message_transport(
 
     await _resolve_thread_owner("inbound")
 
+    # Record the triggering message under the post-rebind session_key, the key
+    # this turn runs under and the verified session the create_code_channel MCP
+    # tool resolves. Lets a code channel the agent opens mid-turn carry this
+    # message as its origin link (Slack then invites the human author and opens
+    # the private channel in their sidebar).
+    if gateway is not None:
+        remember = getattr(gateway, "remember_session_origin", None)
+        if callable(remember):
+            remember(session_key, channel, msg_ts)
+
     # Inbound channels-governance gate (off-loop), same as native handle_message:
     # a ``channels`` policy that denies ``slack`` drops the message before any
     # processing. Default build (no policy) permits — behavior unchanged.

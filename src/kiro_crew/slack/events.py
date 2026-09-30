@@ -871,8 +871,8 @@ async def create_code_channel_core(
     repo: str | None = None,
 ) -> dict:
     """Create and set up a code channel, the one path every caller goes through
-    (the ``/kirocrew codechannel`` slash command), so each creates, invites, sets
-    always-on and posts chrome the same way.
+    (the ``/kirocrew codechannel`` slash command and the ``create_code_channel`` MCP
+    tool), so each creates, invites, sets always-on and posts chrome the same way.
 
     Creates a private code channel, sets it always-on, invites the caller plus the
     configured collaborators, posts a kickoff, tracks it, and populates the context

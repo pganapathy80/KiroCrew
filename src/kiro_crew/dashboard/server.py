@@ -384,6 +384,7 @@ async def _should_prevent_sleep(state: DashboardState, port: int) -> bool:
 _STRICT_INTERNAL_API_PATHS = frozenset(
     {
         "/api/send-message",
+        "/api/create-code-channel",
         "/api/delete-message",
         "/api/update-message",
         "/api/browser-event",
@@ -1892,6 +1893,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/taskrunner", handlers.api_taskrunner_start)
     app.router.add_post("/api/taskrunner/cancel", handlers.api_taskrunner_cancel)
     app.router.add_post("/api/send-message", handlers.api_send_message)
+    # create_code_channel MCP tool — registered here (not the dashboard-only
+    # block) so headless --slack-only mode serves it; on _STRICT_INTERNAL_API_PATHS
+    # like send-message.
+    app.router.add_post("/api/create-code-channel", handlers.api_create_code_channel)
     app.router.add_post("/api/delete-message", handlers.api_delete_message)
     app.router.add_post("/api/update-message", handlers.api_update_message)
     # send_notification MCP tool (RFC notification bus Phase 5) — registered

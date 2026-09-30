@@ -2843,6 +2843,104 @@ def _vet_channel_send(channel_type: str, caller_session: str) -> str:
     return ""
 
 
+async def api_create_code_channel(request: web.Request) -> web.Response:
+    """POST /api/create-code-channel — create_code_channel MCP tool transport.
+
+    Creates a Slack code channel via the gateway's Slack path (the same logic as
+    ``/kirocrew codechannel``): a private, always-on channel with the owner and the
+    configured collaborators invited, a kickoff message, and the context bar posted.
+    MCP/internal-secret only (on ``_STRICT_INTERNAL_API_PATHS``); the tool has
+    already resolved a strict session key before reaching here.
+
+    Body: ``{"name": str}``. Returns ``{"ok", "channel_id"}`` on success; a non-2xx
+    JSON body carries a machine-readable ``code`` field.
+    """
+    state: DashboardState = request.app["state"]
+    # Internal-secret ONLY — this creates a Slack channel and invites people, and
+    # the strict-internal middleware would otherwise also admit loopback dashboard
+    # cookie callers. request["internal_auth"] is set solely on the validated
+    # X-Internal-Secret path the MCP gateway uses.
+    if not request.get("internal_auth"):
+        return web.json_response(
+            {"error": "internal-secret authentication required", "code": "auth_required"},
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    name = str(body.get("name", "") or "").strip()
+    if not name:
+        return web.json_response({"error": "name required", "code": "name_required"}, status=400)
+    # Repo the agent is working on for this task. Bound to THIS channel so the
+    # feature is generic per codebase; empty falls back to the single-repo default.
+    repo = str(body.get("repo", "") or "").strip()
+    callback = getattr(state, "_create_code_channel", None)
+    if callback is None:
+        # No Slack gateway wired (e.g. --slack disabled) — the capability is absent,
+        # not merely denied, so 503 rather than 403/400.
+        return web.json_response(
+            {"error": "code channels unavailable (Slack not running)", "code": "slack_unavailable"},
+            status=503,
+        )
+    # The MCP caller is a session, not a Slack user; the orchestrator falls back to
+    # the owner for the invite, so pass an empty caller id. The caller's verified
+    # session key (the X-Session-Key header every MCP subprocess sends, vetted by
+    # the strict-internal + unix-peer middleware) lets the orchestrator resolve the
+    # Slack message that triggered this turn and create the channel with it as the
+    # origin link — so Slack invites the human author and opens it in their sidebar.
+    caller_session_key = request.headers.get("X-Session-Key", "").strip()
+    result = await callback(name, "", caller_session_key, repo)
+    if not result.get("ok"):
+        err = result.get("error") or "create_failed"
+        # Literal statuses per branch (not a computed `status=` expression) so the
+        # error-code contract can statically verify each coded response.
+        if err in ("code_channels_off", "slack_unavailable"):
+            return web.json_response(
+                {"error": f"could not create code channel: {err}", "code": err}, status=503
+            )
+        if err == "already_in_code_channel":
+            # The caller's session is already working in a code channel and the
+            # gateway refused to open another (the runaway-fan-out loop guard). A
+            # logic conflict, not a server fault, so 409 rather than 502.
+            return web.json_response(
+                {"error": f"could not create code channel: {err}", "code": err}, status=409
+            )
+        return web.json_response(
+            {"error": f"could not create code channel: {err}", "code": err}, status=502
+        )
+    return web.json_response(
+        {
+            "ok": True,
+            "channel_id": result.get("channel_id"),
+            "invite_ok": result.get("invite_ok"),
+            "invite_error": result.get("invite_error"),
+        }
+    )
+
+
+def _code_channel_origin_for_caller(
+    request: web.Request, body: dict, state: Any
+) -> tuple[str, str] | None:
+    """The recorded origin of the caller's code channel, or None.
+
+    Honoured only on the proven-internal transport (``internal_auth``), where
+    ``caller_session`` is the MCP tool's strictly-resolved session key rather
+    than a tool argument. A callback returning anything but a tuple (unwired, or
+    a stand-in state) counts as no origin.
+    """
+    if not request.get("internal_auth"):
+        return None
+    caller = body.get("caller_session", "")
+    resolve = getattr(state, "_code_channel_origin_for_session", None)
+    if not (caller and callable(resolve)):
+        return None
+    origin = resolve(caller)
+    if isinstance(origin, tuple) and len(origin) == 2 and all(origin):
+        return (str(origin[0]), str(origin[1]))
+    return None
+
+
 async def api_send_message(request: web.Request) -> web.Response:
     """POST /api/send-message — send a message to a chat surface and/or dashboard.
 
@@ -3131,7 +3229,19 @@ async def api_send_message(request: web.Request) -> web.Response:
         text, options = extract_options(text)
 
     # --- Authorization gates (before any side effects) ---
+    # A code channel may post back to the one channel it was opened from (its
+    # closing summary, a hand-back to the agent that asked), even when that
+    # channel is not tracked. The binding is the origin the gateway recorded at
+    # creation, looked up by the verified caller session on the internal-secret
+    # transport only; it never admits a channel the caller merely names.
+    origin_post = False
     if target_channel and not is_tracked_channel(target_channel):
+        origin = _code_channel_origin_for_caller(request, body, state)
+        if origin is not None and origin[0] == target_channel:
+            origin_post = True
+            if thread_ts is None:
+                thread_ts = origin[1]
+    if target_channel and not origin_post and not is_tracked_channel(target_channel):
         _sel().log_tool_invocation(
             session_key="dashboard",
             tool_name="send_message",

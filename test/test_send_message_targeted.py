@@ -1749,3 +1749,127 @@ class TestSendMessageToolChannelType:
             out = _call_tool({"text": "hi", "channel_type": "telegram"})
             assert out.startswith("Error:")
             assert "telegram" in out
+
+
+# ── code channel posting back to its own origin ──
+
+_CC_SESSION = "slack:1700.0"
+_ORIGIN = ("C0MAIN00001", "1700000000.000100")
+
+
+def _make_internal_app(state) -> web.Application:
+    """Like _make_app, but every request is on the internal-secret transport."""
+
+    @web.middleware
+    async def _internal(request, handler):
+        request["internal_auth"] = True
+        return await handler(request)
+
+    app = web.Application(middlewares=[_internal])
+    app.router.add_post("/api/send-message", api_send_message)
+    app["state"] = state
+    return app
+
+
+class TestCodeChannelOriginPost:
+    """A code channel may post back to the untracked channel it was opened from.
+
+    Only the origin the gateway recorded for the caller's own code channel is
+    admitted, and only on the internal transport; every other untracked channel
+    is still refused.
+    """
+
+    def _state(self, origin):
+        slack = MagicMock()
+        slack.post_message = AsyncMock(return_value="1700000000.000200")
+        state = _mock_state(slack_client=slack, owner_id="U_OWNER")
+        state._code_channel_origin_for_session = lambda key: (
+            origin if key == _CC_SESSION else None
+        )
+        return state, slack
+
+    async def _send(self, app, body):
+        with patch("kiro_crew.slack.handler.is_tracked_channel", return_value=False):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post("/api/send-message", json=body)
+                return resp.status, await resp.json()
+
+    @pytest.mark.asyncio
+    async def test_origin_channel_is_delivered_threaded_on_origin(self, mock_sel):
+        state, slack = self._state(_ORIGIN)
+        status, _ = await self._send(
+            _make_internal_app(state),
+            {"text": "fixed", "channel": _ORIGIN[0], "caller_session": _CC_SESSION},
+        )
+        assert status == 200
+        assert slack.post_message.call_args.args[0] == _ORIGIN[0]
+        assert slack.post_message.call_args.kwargs["thread_ts"] == _ORIGIN[1]
+
+    @pytest.mark.asyncio
+    async def test_explicit_thread_ts_is_kept(self, mock_sel):
+        state, slack = self._state(_ORIGIN)
+        status, _ = await self._send(
+            _make_internal_app(state),
+            {
+                "text": "fixed",
+                "channel": _ORIGIN[0],
+                "thread_ts": "1700000000.000150",
+                "caller_session": _CC_SESSION,
+            },
+        )
+        assert status == 200
+        assert slack.post_message.call_args.kwargs["thread_ts"] == "1700000000.000150"
+
+    @pytest.mark.asyncio
+    async def test_other_untracked_channel_still_refused(self, mock_sel):
+        state, slack = self._state(_ORIGIN)
+        status, data = await self._send(
+            _make_internal_app(state),
+            {"text": "x", "channel": "C0OTHER0001", "caller_session": _CC_SESSION},
+        )
+        assert status == 403 and "not in tracked channels" in data["error"]
+        slack.post_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_without_internal_auth_still_refused(self, mock_sel):
+        state, slack = self._state(_ORIGIN)
+        status, _ = await self._send(
+            _make_app(state),
+            {"text": "x", "channel": _ORIGIN[0], "caller_session": _CC_SESSION},
+        )
+        assert status == 403
+        slack.post_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_session_without_recorded_origin_still_refused(self, mock_sel):
+        state, slack = self._state(_ORIGIN)
+        status, _ = await self._send(
+            _make_internal_app(state),
+            {"text": "x", "channel": _ORIGIN[0], "caller_session": "slack:9999.0"},
+        )
+        assert status == 403
+        slack.post_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stand_in_state_still_refused(self, mock_sel):
+        """An unwired MagicMock callback returns a mock, not a tuple: no origin."""
+        state = _mock_state(slack_client=MagicMock(), owner_id="U_OWNER")
+        status, _ = await self._send(
+            _make_internal_app(state),
+            {"text": "x", "channel": _ORIGIN[0], "caller_session": _CC_SESSION},
+        )
+        assert status == 403
+
+
+class TestSendMessageToolChannelIdentity:
+    def test_channel_send_forwards_strict_caller_session(self):
+        with _tool_mcp_core(strict=_CC_SESSION, post={"ok": True, "delivered_to": "slack"}) as m:
+            _call_tool({"text": "fixed", "channel": _ORIGIN[0]})
+            payload = m["post"].call_args.args[1]
+            assert payload["caller_session"] == _CC_SESSION
+
+    def test_channel_send_without_strict_identity_is_not_refused(self):
+        with _tool_mcp_core(strict="", post={"ok": True, "delivered_to": "slack"}) as m:
+            out = _call_tool({"text": "hi", "channel": _ORIGIN[0]})
+            assert not out.startswith("Error")
+            assert "caller_session" not in m["post"].call_args.args[1]

@@ -35,6 +35,7 @@
     "chat_tag": "Tag session",
     "suggest_followup": "Suggest follow-ups",
     "send_message": "Send message",
+    "create_code_channel": "Open code channel",
     "send_notification": "Send notification",
     "delete_message": "Delete message",
     "update_message": "Edit message",
